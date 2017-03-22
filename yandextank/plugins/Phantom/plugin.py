@@ -7,6 +7,8 @@ import os
 import subprocess
 import time
 
+import copy
+
 from ...common.util import execute, expand_to_seconds
 from ...common.interfaces import AbstractPlugin, AbstractCriterion, GeneratorPlugin
 
@@ -95,12 +97,27 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
     def prepare_test(self):
         aggregator = self.core.job.aggregator_plugin
 
+        #self.config = self.phantom.compose_config()
+        self.phantoms = []
         if not self.config and not self.phout_import_mode:
+            if type(self.phantom.streams[0].address) is list:
+                for index, address in enumerate(self.phantom.streams[0].address):
+                    phantom = PhantomConfig(self.core)
+                    phantom.read_config()
+                    phantom.streams[0].address = address
+                    phantom.streams[0].port = self.phantom.streams[0].port[index]
+                    phantom.streams[0].ipv6 = self.phantom.streams[0].ipv6[index]
+                    phantom.streams[0].resolved_ip = self.phantom.streams[0].resolved_ip[index]
 
-            # generate config
-            self.config = self.phantom.compose_config()
-            args = [self.phantom_path, 'check', self.config]
+                    args = [self.phantom_path, 'check', phantom.compose_config()]
 
+                    self.phantoms.append(phantom)
+
+            else:
+                args = [self.phantom_path, 'check', self.phantom.compose_config()]
+                phantom = self.phantom
+
+            #self.phantom = phantom
             try:
                 result = execute(args, catch_out=True)
             except OSError:
@@ -114,14 +131,14 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
             if result[2]:
                 raise RuntimeError(
                     "Subprocess returned message: %s" % result[2])
-            reader = PhantomReader(self.phantom.phout_file)
+            reader = PhantomReader(phantom.phout_file)
             logger.debug(
                 "Linking sample reader to aggregator."
-                " Reading samples from %s", self.phantom.phout_file)
+                " Reading samples from %s", phantom.phout_file)
 
             logger.debug(
                 "Linking stats reader to aggregator."
-                " Reading stats from %s", self.phantom.stat_log)
+                " Reading stats from %s", phantom.stat_log)
         else:
             reader = PhantomReader(self.predefined_phout)
             logger.debug(
@@ -129,9 +146,9 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
                 " Reading samples from %s", self.predefined_phout)
         if aggregator:
             aggregator.reader = reader
-            info = self.phantom.get_info()
+            info = phantom.get_info()
             aggregator.stats_reader = PhantomStatsReader(
-                self.phantom.stat_log, info)
+                phantom.stat_log, info)
 
             aggregator.add_result_listener(self)
         try:
@@ -140,8 +157,10 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
             logger.debug("Console not found: %s", ex)
             console = None
 
-        self.core.job.phantom_info = self.phantom.get_info()
+        self.core.job.phantom_info = phantom.get_info()
 
+        tmp_phantom = self.phantom
+        self.phantom = phantom
         if console and aggregator:
             widget = PhantomProgressBarWidget(self)
             console.add_info_widget(widget)
@@ -152,28 +171,56 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
             aggregator = self.core.get_plugin_of_type(AggregatorPlugin)
             aggregator.add_result_listener(widget)
 
+        self.phantom = tmp_phantom
+
     def start_test(self):
         if not self.phout_import_mode:
-            args = [self.phantom_path, 'run', self.config]
+            if type(self.phantom.streams[0].address) is list and len(self.phantoms) > 0:
+                for phantom in self.phantoms:
+
+                    args = [self.phantom_path, 'run', phantom.compose_config()]
+                    #self.phantom = phantom
+
+                    #args = [self.phantom_path, 'run', self.phantom.compose_config()]
+                    if self.taskset_affinity != '':
+                        args = [
+                                   self.core.taskset_path, '-c', self.taskset_affinity
+                               ] + args
+                        logger.debug(
+                            "Enabling taskset for phantom with affinity: %s,"
+                            " cores count: %d", self.taskset_affinity, self.cpu_count)
+
+                    phantom_stderr_file = self.core.mkstemp(
+                        ".log", "phantom_stdout_stderr_")
+                    self.core.add_artifact_file(phantom_stderr_file)
+                    phantom_stderr = open(phantom_stderr_file, 'w')
+
+                    self.process = subprocess.Popen(
+                        args,
+                        stderr=phantom_stderr,
+                        stdout=phantom_stderr,
+                        close_fds=True)
+
+                self.phantom = phantom
+            else:
+                args = [self.phantom_path, 'run', self.phantom.compose_config()]
+                if self.taskset_affinity != '':
+                    args = [
+                               self.core.taskset_path, '-c', self.taskset_affinity
+                           ] + args
+                    logger.debug(
+                        "Enabling taskset for phantom with affinity: %s,"
+                        " cores count: %d", self.taskset_affinity, self.cpu_count)
+                self.process = subprocess.Popen(
+                    args,
+                    stderr=self.phantom_stderr,
+                    stdout=self.phantom_stderr,
+                    close_fds=True)
+
             logger.debug(
                 "Starting %s with arguments: %s", self.phantom_path, args)
-            if self.taskset_affinity != '':
-                args = [
-                    self.core.taskset_path, '-c', self.taskset_affinity
-                ] + args
-                logger.debug(
-                    "Enabling taskset for phantom with affinity: %s,"
-                    " cores count: %d", self.taskset_affinity, self.cpu_count)
+
             self.phantom_start_time = time.time()
-            phantom_stderr_file = self.core.mkstemp(
-                ".log", "phantom_stdout_stderr_")
-            self.core.add_artifact_file(phantom_stderr_file)
-            self.phantom_stderr = open(phantom_stderr_file, 'w')
-            self.process = subprocess.Popen(
-                args,
-                stderr=self.phantom_stderr,
-                stdout=self.phantom_stderr,
-                close_fds=True)
         else:
             if not os.path.exists(self.predefined_phout):
                 raise RuntimeError(

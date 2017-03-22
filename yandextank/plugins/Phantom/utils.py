@@ -189,6 +189,14 @@ class PhantomConfig:
             raise ValueError("Total ammo count cannot be zero")
         return result
 
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        #result = cls.__new__(cls)
+        result = cls()
+        for k, v in self.__dict__.items():
+            setattr(result, k, copy.deepcopy(v, memo))
+        return result
+
 
 class StreamConfig:
     """ each test stream's config """
@@ -268,11 +276,25 @@ class StreamConfig:
         self.phantom_http_field = self.get_option("phantom_http_field", "")
         self.phantom_http_entity = self.get_option("phantom_http_entity", "")
 
-        self.address = self.get_option('address', '127.0.0.1')
+
+        addresses = self.get_option('address', '127.0.0.1').split(',')
         do_test_connect = int(self.get_option("connection_test", "1")) > 0
         explicit_port = self.get_option('port', '')
-        self.ipv6, self.resolved_ip, self.port, self.address = self.address_wizard.resolve(
-            self.address, do_test_connect, explicit_port)
+        if len(addresses) > 1:
+            self.address = []
+            self.port = []
+            self.ipv6 = []
+            self.resolved_ip = []
+            for addr in addresses:
+                ipv6, resolved_ip, port, addr = self.address_wizard.resolve(addr, do_test_connect, explicit_port)
+                self.address.append(addr)
+                self.ipv6.append(ipv6)
+                self.resolved_ip.append(resolved_ip)
+                self.port.append(port)
+
+        else:
+            self.ipv6, self.resolved_ip, self.port, self.address = self.address_wizard.resolve(
+                addresses[0], do_test_connect, explicit_port)
 
         logger.info(
             "Resolved %s into %s:%s", self.address, self.resolved_ip, self.port)
