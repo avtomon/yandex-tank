@@ -4,6 +4,8 @@ import copy
 import logging
 import multiprocessing
 import string
+import json, requests
+import random
 
 from pkg_resources import resource_string
 from yandextank.common.util import AddressWizard
@@ -278,6 +280,28 @@ class StreamConfig:
 
 
         addresses = self.get_option('address', '127.0.0.1').split(',')
+        address_file = self.get_option('address_file', '')
+        if bool(address_file):
+            addresses = []
+            with open(address_file, 'r') as read_file:
+                for line in read_file:
+                    addresses.append(line.strip())
+        foxtools_proxies = self.get_option('foxtools_proxy', '')
+        if bool(foxtools_proxies):
+            response = json.loads(requests.get(url=foxtools_proxies).content)
+            page_count = response['response']['pageCount']
+            addresses = []
+            for item in response['response']['items']:
+                if item['anonymity'] in ['HighKeepAlive', 'High']:
+                    addresses.append(item['ip'] + ':' + str(item['port']))
+            for page in range(2, page_count + 1):
+                response = json.loads(requests.get(url = foxtools_proxies, params = {'page': page}).content)
+                for item in response['response']['items']:
+                    if item['anonymity'] in ['HighKeepAlive', 'High']:
+                        addresses.append(item['ip'] + ':' + str(item['port']))
+        proxy_count = int(self.get_option('proxy_count', -1))
+        if proxy_count < len(addresses):
+            addresses = random.sample(addresses, proxy_count)
         do_test_connect = int(self.get_option("connection_test", "1")) > 0
         explicit_port = self.get_option('port', '')
         if len(addresses) > 1:

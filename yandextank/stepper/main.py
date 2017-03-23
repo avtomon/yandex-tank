@@ -163,6 +163,12 @@ class StepperWrapper(object):
         self.instances = int(
             self.get_option(self.OPTION_INSTANCES_LIMIT, '1000'))
         self.uris = self.get_option("uris", '').strip().split("\n")
+        uris_from_file = self.get_option("uris_file", False)
+        if uris_from_file:
+            self.uris = []
+            with open(uris_from_file, 'r') as read_file:
+                for line in read_file:
+                    self.uris.append(line.strip())
         while '' in self.uris:
             self.uris.remove('')
         rx = re.compile('\[(.*?)\]')
