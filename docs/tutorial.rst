@@ -9,85 +9,86 @@ access is permitted and server is tuned. How to make a test?
 
   This guide is for ``phantom`` load generator.
 
-Create a file on a server with Yandex.Tank: **load.ini**
+Create a file on a server with Yandex.Tank: **load.yaml**
 
-::
+.. code-block:: yaml
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=line(1, 100, 10m) ;load scheme
+  phantom:
+    address: 203.0.113.1:80 # [Target's address]:[target's port]
+    uris:
+      - /
+    load_profile:
+      load_type: rps # schedule load by defining requests per second
+      schedule: line(1, 10, 10m) # starting from 1rps growing linearly to 10rps during 10 minutes
+  console:
+    enabled: true # enable console output
+  telegraf:
+    enabled: false # let's disable telegraf monitoring for the first time
 
-``phantom`` have 3 primitives for describing load scheme: 
-
-------------
-
-1. ``step (a,b,step,dur)`` makes stepped load, where a,b are start/end load
-values, step - increment value, dur - step duration. 
-
-Example:
-  ``step(25, 5, 5, 60)`` - stepped load from 25 to 5 rps, with 5 rps steps, 
-  step duration 60s. ``step(5, 25, 5, 60)`` - stepped load from 5 to 25 rps, 
-  with 5 rps steps, step duration 60s
+And run:
+``$ yandex-tank -c load.yaml``
 
 ------------
 
-2. ``line (a,b,dur)`` makes linear load, where ``a,b`` are start/end load, ``dur``
-- the time for linear load increase from a to b. 
+``phantom`` have 3 primitives for describing load scheme:
 
-Example:
-  ``line(100, 1, 10m)`` - linear load from 100 to 1 rps, duration - 10
-  minutes ``line(1, 100, 10m)`` - linear load from 1 to 100 rps, duration
-  - 10 minutes
+ 1. ``step (a,b,step,dur)`` makes stepped load, where a,b are start/end load values, step - increment value, dur - step duration.
 
-------------
+  Examples:
+   * ``step(25, 5, 5, 60)`` - stepped load from 25 to 5 rps, with 5 rps steps, step duration 60s.
+   * ``step(5, 25, 5, 60)`` - stepped load from 5 to 25 rps, with 5 rps steps, step duration 60s
 
-3. ``const (load,dur)`` makes constant load. ``load`` - rps amount, ``dur`` 
-- load duration. 
+ 2. ``line (a,b,dur)`` makes linear load, where ``a,b`` are start/end load, ``dur`` - the time for linear load increase from a to b.
 
-.. note::
-  ``const(0, 10)`` - 0 rps for 10 seconds, 
-  in fact 10s pause in a test.
+  Examples:
+   * ``line(10, 1, 10m)`` - linear load from 10 to 1 rps, duration - 10 minutes
+   * ``line(1, 10, 10m)`` - linear load from 1 to 10 rps, duration - 10 minutes
 
-Example:
-  ``const(100,10m)`` - constant load for 100 rps for 10 mins.
+ 3. ``const (load,dur)`` makes constant load. ``load`` - rps amount, ``dur`` - load duration.
 
-------------
+  Examples:
+   * ``const(10,10m)`` - constant load for 10 rps for 10 minutes.
+   * ``const(0, 10)`` - 0 rps for 10 seconds, in fact 10s pause in a test.
 
 .. note::
-  You can set fractional load like this: ``line(1.1, 2.5, 10)`` 
-  -- from 1.1rps to 2.5 for 10 seconds. 
+ You can set fractional load like this:
+  ``line(1.1, 2.5, 10)`` - from 1.1rps to 2.5 for 10 seconds.
 
 .. note::
-  ``const(0, 10)`` 0 rps for 10 seconds, in fact 10s pause in a test.
-
-.. note::
-  ``step`` and ``line`` could be used with increasing and decreasing intensity: 
+ ``step`` and ``line`` could be used with increasing and decreasing intensity:
 
 
 You can specify complex load schemes using those primitives.
 
 Example:
-  ``rps_schedule=line(1,10,10m) const(10,10m)`` 
+  ``schedule: line(1, 10, 10m) const(10,10m)``
   
-  linear load from 1 to 10, duration 10 mins and then 10 mins of 10 RPS constant load.
+  linear load from 1 to 10rps during 10 minutes, then 10 minutes of 10rps constant load.
 
 Time duration could be defined in seconds, minutes (m) and hours (h).
 For example: ``27h103m645``
 
-For a test with constant load at 10rps for 10 minutes, ``load.ini`` should
-have next lines:
+For a test with constant load at 10rps for 10 minutes, ``load.yaml`` should
+have following lines:
 
-:: 
+.. code-block:: yaml
 
-  [phantom] 
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port. 
-  rps_schedule=const(10, 10m) ;load scheme
+  phantom:
+    address: 203.0.113.1:80 # [Target's address]:[target's port]
+    uris:
+      - /uri1
+      - /uri2
+    load_profile:
+      load_type: rps # schedule load by defining requests per second
+      schedule: const(10, 10m) # starting from 1rps growing linearly to 10rps during 10 minutes
+  console:
+    enabled: true # enable console output
+  telegraf:
+    enabled: false # let's disable telegraf monitoring for the first time
 
 
 Preparing requests
-===================
+==================
 
 There are several ways to set up requests: 
  * Access mode 
@@ -104,7 +105,8 @@ There are several ways to set up requests:
 To specify external ammo file use ``ammofile`` option. 
 
 .. note::
-  You can specify URL to ammofile, http(s). Small ammofiles (~<100MB) will be downloaded as is, to directory ``/tmp/<hash>``, large files will be readed from stream. 
+  You can specify URL to ammofile, http(s). Small ammofiles (~<100MB) will be downloaded as is,
+  to directory ``/tmp/<hash>``, large files will be read from stream.
 
 .. note::
 
@@ -115,67 +117,49 @@ To specify external ammo file use ``ammofile`` option.
   Example:
   ::
       
-    [phantom]
-    address=203.0.113.1 ; Target's address
-    ammofile=https://yourhost.tld/path/to/ammofile.txt
+    phantom:
+      address: 203.0.113.1:80
+      ammofile: https://yourhost.tld/path/to/ammofile.txt
 
 
-Access mode
------------
+URI-style, URIs in load.yaml
+----------------------------
 
-INI-file configuration: ``ammo_type=access``
-
-You can use ``access.log`` file from your webserver as a source of requests.
-Just add to load.ini options ``ammo_type=access`` and ``ammofile=/tmp/access.log`` 
-where /tmp/access.log is a path to access.log file.
-
-:: 
-
-  [phantom] 
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port 
-  rps_schedule=const(10, 10m) ;load scheme
-  header_http = 1.1 
-  headers = [Host: www.target.example.com] 
-    [Connection: close] 
-  ammofile=/tmp/access.log
-  ammo_type=access
-
-Parameter ``headers`` defines headers values (if it nessessary).
-
-
-URI-style, URIs in load.ini
----------------------------
-
-INI-file configuration: Don't specify ``ammo_type`` explicitly for this type of ammo.
+YAML-file configuration: Don't specify ``ammo_type`` explicitly for this type of ammo.
 
 Update configuration file with HTTP headers and URIs:
 
-:: 
+.. code-block:: yaml
 
-  [phantom] 
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port 
-  rps_schedule=const(10, 10m) ;load scheme
-  ; Headers and URIs for GET requests 
-  header_http = 1.1 
-  headers = [Host: www.target.example.com] 
-    [Connection: close] 
-  uris = /   
-    /buy   
-    /sdfg?sdf=rwerf   
-    /sdfbv/swdfvs/ssfsf
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: rps
+      schedule: line(1, 10, 10m)
+    header_http: "1.1"
+    headers:
+      - "[Host: www.target.example.com]"
+      - "[Connection: close]"
+    uris:
+      - "/uri1"
+      - "/buy"
+      - "/sdfg?sdf=rwerf"
+      - "/sdfbv/swdfvs/ssfsf"
+  console:
+    enabled: true
+  telegraf:
+    enabled: false
 
 Parameter ``uris`` contains uri, which should be used for requests generation.
 
 .. note::
 
-  Pay attention to sample above, because whitespaces in multiline ``uris`` and ``headers`` options are important.
+  Pay attention to the sample above, because whitespaces in multiline ``uris`` and ``headers`` options are important.
 
 URI-style, URIs in file
 -----------------------
 
-INI-file configuration: ``ammo_type=uri``
+YAML-file configuration: ``ammo_type: uri``
 
 Create a file with declared requests: ``ammo.txt``
 
@@ -190,7 +174,7 @@ Create a file with declared requests: ``ammo.txt``
   [Cookie: test]
   /buy/?rt=0&station_to=7&station_from=9
 
-File consist of list of URIs and headers to be added to every request defined below.
+File consists of list of URIs and headers to be added to every request defined below.
 Every URI must begin from a new line, with leading ``/``.
 Each line that begins from ``[`` is considered as a header.
 Headers could be (re)defined in the middle of URIs, as in sample above. 
@@ -203,7 +187,7 @@ Request may be marked by tag, you can specify it with whitespace following URI.
 URI+POST-style
 --------------
 
-INI-file configuration: ``ammo_type=uripost``
+YAML-file configuration: ``ammo_type: uripost``
 
 Create a file with declared requests: ``ammo.txt``
 
@@ -227,7 +211,7 @@ Each URI line begins with a number which is the size of the following POST body.
 Request-style
 -------------
 
-INI-file configuration: ``ammo_type=phantom``
+YAML-file configuration: ``ammo_type: phantom``
 
 Full requests listed in a separate file. For more complex
 requests, like POST, you'll have to create a special file. File format
@@ -251,6 +235,7 @@ because '\r' symbols are strictly required.
 .. note:: 
 
   Parameter ``ammo_type`` is unnecessary, request-style is default ammo type.
+
 =======
 
 **sample GET requests (null body)**
@@ -334,8 +319,8 @@ sample ammo generators you may find on the :doc:`ammo_generators` page.
 Run Test!
 =========
 
-1. Request specs in load.ini -- just run as ``yandex-tank``
-2. Request specs in ammo.txt -- run as ``yandex-tank ammo.txt``
+1. Request specs in load.yaml -- run as ``yandex-tank -c load.yaml``
+2. Request specs in ammo.txt -- run as ``yandex-tank -c load.yaml ammo.txt``
 
 Yandex.Tank detects requests format and generates ultimate requests
 versions.
@@ -355,7 +340,7 @@ file ``phout.txt`` is being written, which could be analyzed later.
 If you need more human-readable report, you can try Report plugin,
 You can found it `here <https://github.com/yandex-load/yatank-online>`_
 
-If you need to upload results to external storage, such as Graphite or InfluxDB, you can use one of existing artifacts uploading modules :doc:`core_and_modules`
+If you need to upload results to an external storage, such as Graphite or InfluxDB, you can use one of existing artifacts uploading modules :doc:`core_and_modules`
 
 Tags
 ====
@@ -389,16 +374,21 @@ Example:
 SSL
 ===
 
-To activate SSL add ``ssl = 1`` to ``load.ini``. Don't forget to change port
-number to appropriate value. Now, our basic config looks like that:
+To activate SSL add ``phantom: {ssl: true}`` to ``load.yaml``. 
+Now, our basic config looks like that:
 
-::
+.. code-block:: yaml
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80; target's port
-  rps_schedule=const (10,10m) ;Load scheme
-  ssl=1
+  phantom:
+    address: 203.0.113.1:443
+      load_profile:
+        load_type: rps
+        schedule: line(1, 10, 10m)
+    ssl: true
+
+.. note::
+
+  Do not forget to specify ssl port to `address`. Otherwise, you might get 'protocol errors'.
 
 Autostop 
 ========
@@ -416,36 +406,38 @@ answers with specified code per second).
 
 Examples:
 
-  ``autostop = http(4xx,25%,10)`` – stop test, if amount of 4xx http codes in every second of last 10s period exceeds 25% of answers (relative threshold).
+  ``autostop: http(4xx,25%,10)`` – stop test, if amount of 4xx http codes in every second of last 10s period exceeds 25% of answers (relative threshold).
 
-  ``autostop = net(101,25,10)`` – stop test, if amount of 101 net-codes in every second of last 10s period is more than 25 (absolute threshold).
+  ``autostop: net(101,25,10)`` – stop test, if amount of 101 net-codes in every second of last 10s period is more than 25 (absolute threshold).
 
-  ``autostop = net(xx,25,10)`` – stop test, if amount of non-zero net-codes in every second of last 10s period is more than 25 (absolute threshold).
+  ``autostop: net(xx,25,10)`` – stop test, if amount of non-zero net-codes in every second of last 10s period is more than 25 (absolute threshold).
 
 Average time conditions
 -----------------------
 
 Example: 
-  ``autostop = time(1500,15)`` – stops test, if average answer time exceeds 1500ms.
+  ``autostop: time(1500,15)`` – stops test, if average answer time exceeds 1500ms.
 
-So, if we want to stop test when all answers in 1 second period are 5xx plus some network and timing factors - add autostop line to load.ini:
+So, if we want to stop test when all answers in 1 second period are 5xx plus some network and timing factors - add autostop line to load.yaml:
 
-::
+.. code-block:: yaml
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=const(10, 10m) ;load scheme
-  [autostop]
-  autostop=time(1s,10s)
-    http(5xx,100%,1s)
-    net(xx,1,30)
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: rps
+      schedule: line(1, 10, 10m)
+  autostop:
+    autostop:
+      - time(1s,10s)
+      - http(5xx,100%,1s)
+      - net(xx,1,30)
 
 Logging
 =======
 
 Looking into target's answers is quite useful in debugging. For doing
-that add ``writelog = 1`` to ``load.ini``. 
+that use parameter `writelog <http://yandextank.readthedocs.io/en/latest/config_reference.html#writelog-string>`_, e.g. add ``phantom: {writelog: all}`` to ``load.yaml`` to log all messages.
 
 .. note::
   Writing answers on high load leads to intensive disk i/o 
@@ -481,19 +473,21 @@ Example:
   HTTP/1.1 200 OK
   Content-Type: application/javascript;charset=UTF-8
 
-For ``load.ini`` like this:
+For ``load.yaml`` like this:
   
-::
+.. code-block:: yaml
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=const(10, 10m) ;load scheme
-  writelog=1
-  [autostop]
-  autostop=time(1,10)
-    http(5xx,100%,1s)
-    net(xx,1,30)
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: rps
+      schedule: line(1, 10, 10m)
+    writelog: all
+  autostop:
+    autostop:
+      - time(1,10)
+      - http(5xx,100%,1s)
+      - net(xx,1,30)
 
 Results in phout
 ================
@@ -523,6 +517,131 @@ Phout example:
 .. note::
   contents of phout depends on phantom version installed on your Yandex.Tank system.
 
+net codes are system codes from errno.h, on most Debian-based systems those are:
+
+::
+
+  1 EPERM	Operation not permitted
+  2	ENOENT	No such file or directory
+  3	ESRCH	No such process
+  4	EINTR	Interrupted system call
+  5	EIO	Input/output error
+  6	ENXIO	No such device or address
+  7	E2BIG	Argument list too long
+  8	ENOEXEC	Exec format error
+  9	EBADF	Bad file descriptor
+  10	ECHILD	No child processes
+  11	EAGAIN	Resource temporarily unavailable
+  12	ENOMEM	Cannot allocate memory
+  13	EACCES	Permission denied
+  14	EFAULT	Bad address
+  15	ENOTBLK	Block device required
+  16	EBUSY	Device or resource busy
+  17	EEXIST	File exists
+  18	EXDEV	Invalid cross-device link
+  19	ENODEV	No such device
+  20	ENOTDIR	Not a directory
+  21	EISDIR	Is a directory
+  22	EINVAL	Invalid argument
+  23	ENFILE	Too many open files in system
+  24	EMFILE	Too many open files
+  25	ENOTTY	Inappropriate ioctl for device
+  26	ETXTBSY	Text file busy
+  27	EFBIG	File too large
+  28	ENOSPC	No space left on device
+  29	ESPIPE	Illegal seek
+  30	EROFS	Read-only file system
+  31	EMLINK	Too many links
+  32	EPIPE	Broken pipe
+  33	EDOM	Numerical argument out of domain
+  34	ERANGE	Numerical result out of range
+  35	EDEADLOCK	Resource deadlock avoided
+  36	ENAMETOOLONG	File name too long
+  37	ENOLCK	No locks available
+  38	ENOSYS	Function not implemented
+  39	ENOTEMPTY	Directory not empty
+  40	ELOOP	Too many levels of symbolic links
+  42	ENOMSG	No message of desired type
+  43	EIDRM	Identifier removed
+  44	ECHRNG	Channel number out of range
+  45	EL2NSYNC	Level 2 not synchronized
+  46	EL3HLT	Level 3 halted
+  47	EL3RST	Level 3 reset
+  48	ELNRNG	Link number out of range
+  49	EUNATCH	Protocol driver not attached
+  50	ENOCSI	No CSI structure available
+  51	EL2HLT	Level 2 halted
+  52	EBADE	Invalid exchange
+  53	EBADR	Invalid request descriptor
+  54	EXFULL	Exchange full
+  55	ENOANO	No anode
+  56	EBADRQC	Invalid request code
+  57	EBADSLT	Invalid slot
+  59	EBFONT	Bad font file format
+  60	ENOSTR	Device not a stream
+  61	ENODATA	No data available
+  62	ETIME	Timer expired
+  63	ENOSR	Out of streams resources
+  64	ENONET	Machine is not on the network
+  65	ENOPKG	Package not installed
+  66	EREMOTE	Object is remote
+  67	ENOLINK	Link has been severed
+  68	EADV	Advertise error
+  69	ESRMNT	Srmount error
+  70	ECOMM	Communication error on send
+  71	EPROTO	Protocol error
+  72	EMULTIHOP	Multihop attempted
+  73	EDOTDOT	RFS specific error
+  74	EBADMSG	Bad message
+  75	EOVERFLOW	Value too large for defined data type
+  76	ENOTUNIQ	Name not unique on network
+  77	EBADFD	File descriptor in bad state
+  78	EREMCHG	Remote address changed
+  79	ELIBACC	Can not access a needed shared library
+  80	ELIBBAD	Accessing a corrupted shared library
+  81	ELIBSCN	.lib section in a.out corrupted
+  82	ELIBMAX	Attempting to link in too many shared libraries
+  83	ELIBEXEC	Cannot exec a shared library directly
+  84	EILSEQ	Invalid or incomplete multibyte or wide character
+  85	ERESTART	Interrupted system call should be restarted
+  86	ESTRPIPE	Streams pipe error
+  87	EUSERS	Too many users
+  88	ENOTSOCK	Socket operation on non-socket
+  89	EDESTADDRREQ	Destination address required
+  90	EMSGSIZE	Message too long
+  91	EPROTOTYPE	Protocol wrong type for socket
+  92	ENOPROTOOPT	Protocol not available
+  93	EPROTONOSUPPORT	Protocol not supported
+  94	ESOCKTNOSUPPORT	Socket type not supported
+  95	ENOTSUP	Operation not supported
+  96	EPFNOSUPPORT	Protocol family not supported
+  97	EAFNOSUPPORT	Address family not supported by protocol
+  98	EADDRINUSE	Address already in use
+  99	EADDRNOTAVAIL	Cannot assign requested address
+  100	ENETDOWN	Network is down
+  101	ENETUNREACH	Network is unreachable
+  102	ENETRESET	Network dropped connection on reset
+  103	ECONNABORTED	Software caused connection abort
+  104	ECONNRESET	Connection reset by peer
+  105	ENOBUFS	No buffer space available
+  106	EISCONN	Transport endpoint is already connected
+  107	ENOTCONN	Transport endpoint is not connected
+  108	ESHUTDOWN	Cannot send after transport endpoint shutdown
+  109	ETOOMANYREFS	Too many references: cannot splice
+  110	ETIMEDOUT	Connection timed out
+  111	ECONNREFUSED	Connection refused
+  112	EHOSTDOWN	Host is down
+  113	EHOSTUNREACH	No route to host
+  114	EALREADY	Operation already in progress
+  115	EINPROGRESS	Operation now in progress
+  116	ESTALE	Stale file handle
+  117	EUCLEAN	Structure needs cleaning
+  118	ENOTNAM	Not a XENIX named type file
+  119	ENAVAIL	No XENIX semaphores available
+  120	EISNAM	Is a named type file
+  121	EREMOTEIO	Remote I/O error
+  122	EDQUOT	Disk quota exceeded
+
 Graph and statistics
 ====================
 
@@ -530,65 +649,46 @@ Use `Report plugin <https://github.com/yandex-load/yatank-online>`_
 OR
 use your favorite stats packet, R, for example.
 
-Precise timings
-==============
-
-You can set precise timings in ``load.ini`` with ``verbose_histogram``
-parameter like this:
-
-::
-  
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=const(10, 10m) ;load scheme
-  [aggregator]
-  verbose_histogram = 1
-
-.. note::
-  Please keep an eye, last value of `time_periods` is no longer used as response timeout
-  Use phantom.timeout option.
-
 
 Thread limit
 ============
 
-``instances=N`` in ``load.ini`` limits number of simultanious
+``instances: N`` in ``load.yaml`` limits number of simultanious
 connections (threads). 
 
 Example with 10 threads limit:
 
-::
+.. code-block:: yaml
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=const(10, 10m) ;load scheme
-  instances=10
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: rps
+      schedule: line(1, 10, 10m)
+    instances: 10
 
 Dynamic thread limit
 ====================
 
-``instances_schedule = <instances increasing scheme>`` -- test with
-active instances schedule will be performed if load scheme is not
-defined. Bear in mind that active instances number cannot be decreased
+You can specify ``load_type: instances`` instead of 'rps' to schedule a number of active instances
+which generate as much rps as they manage to.
+Bear in mind that active instances number cannot be decreased
 and final number of them must be equal to ``instances`` parameter value.
 
 Example:
 
-::
+.. code-block:: yaml
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ; target's port
-  instances_schedule = line(1,10,10m)
-  loop=10000 ; ammo loops count
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: instances
+      schedule: line(1,10,10m)
+    instances: 10
+    loop: 10000 # don't stop when the end of ammo is reached but loop it 10000 times
 
 .. note::
-  Load scheme is excluded from this load.ini as we used ``instances_schedule`` parameter.
-
-.. note::
-  When using ``instances_schedule`` you should specify how many loops of
+  When using ``load_type: instances`` you should specify how many loops of
   ammo you want to generate because tank can't find out from the schedule
   how many ammo do you need
 
@@ -597,34 +697,37 @@ Custom stateless protocol
 
 In necessity of testing stateless HTTP-like protocol, Yandex.Tank's HTTP
 parser could be switched off, providing ability to generate load with
-any data, receiving any answer in return. To do that add
-``tank_type = 2`` to ``load.ini``. 
+any data, receiving any answer in return. To do that use
+`tank_type <http://yandextank.readthedocs.io/en/latest/config_reference.html#tank-type-string>`_ parameter:
+
+.. code-block:: yaml
+
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: rps
+      schedule: line(1, 10, 10m)
+    instances: 10
+    tank_type: none
 
 .. note::
 
   **Indispensable condition: Connection close must be initiated by remote side**
-
-::
-
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=const(10, 10m) ;load scheme
-  instances=10
-  tank_type=2
 
 Gatling 
 =======
 
 If server with Yandex.Tank have several IPs, they may be
 used to avoid outcome port shortage. Use ``gatling_ip`` parameter for
-that. Load.ini:
+that. load.yaml:
 
-::
 
-  [phantom]
-  address=203.0.113.1 ;Target's address
-  port=80 ;target's port
-  rps_schedule=const(10, 10m) ;load scheme
-  instances=10
-  gatling_ip = IP1 IP2
+.. code-block:: yaml
+
+  phantom:
+    address: 203.0.113.1:80
+    load_profile:
+      load_type: rps
+      schedule: line(1, 10, 10m)
+    instances: 10
+    gatling_ip: IP1 IP2

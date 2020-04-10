@@ -2,55 +2,43 @@
 # FIXME: 3 there is no graceful way to interrupt the process of phout import
 # TODO: phout import
 import logging
-import multiprocessing as mp
-import os
 import subprocess
 import time
+from threading import Event
 
-from ...common.util import execute, expand_to_seconds
-from ...common.interfaces import AbstractPlugin, AbstractCriterion, GeneratorPlugin
-
-from .reader import PhantomReader, PhantomStatsReader
+from .reader import PhantomReader, PhantomStatsReader, string_to_df
 from .utils import PhantomConfig
 from .widget import PhantomInfoWidget, PhantomProgressBarWidget
-from ..Aggregator import Plugin as AggregatorPlugin
 from ..Autostop import Plugin as AutostopPlugin
 from ..Console import Plugin as ConsolePlugin
+from ...common.interfaces import AbstractCriterion, GeneratorPlugin
+from ...common.util import expand_to_seconds, FileMultiReader
+
+from netort.process import execute
 
 logger = logging.getLogger(__name__)
 
 
-class Plugin(AbstractPlugin, GeneratorPlugin):
+class Plugin(GeneratorPlugin):
     """     Plugin for running phantom tool    """
 
     OPTION_CONFIG = "config"
-    SECTION = PhantomConfig.SECTION
 
-    def __init__(self, core):
-        AbstractPlugin.__init__(self, core)
-        self.config = None
-        self.process = None
-
+    def __init__(self, core, cfg, name):
+        super(Plugin, self).__init__(core, cfg, name)
+        self.phout_finished = Event()
         self.predefined_phout = None
-        self.phout_import_mode = False
         self.did_phout_import_try = False
-
-        self.phantom_path = None
         self.eta_file = None
         self.processed_ammo_count = 0
-        self.phantom_start_time = time.time()
-        self.buffered_seconds = "2"
-
-        self.taskset_affinity = None
-        self.cpu_count = mp.cpu_count()
-
-        self.phantom = None
         self.cached_info = None
-        self.phantom_stderr = None
-
         self.exclude_markers = []
-
-        self.enum_ammo = False
+        self._stat_log = None
+        self._phantom = None
+        self.config = None
+        self.enum_ammo = None
+        self.phout_import_mode = None
+        self.start_time = None
 
     @staticmethod
     def get_key():
@@ -67,14 +55,10 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
     def configure(self):
         # plugin part
         self.config = self.get_option(self.OPTION_CONFIG, '')
-        self.phantom_path = self.get_option("phantom_path", 'phantom')
+        self.affinity = self.get_option('affinity', '')
         self.enum_ammo = self.get_option("enum_ammo", False)
         self.buffered_seconds = int(
             self.get_option("buffered_seconds", self.buffered_seconds))
-        self.exclude_markers = set(
-            filter((lambda marker: marker != ''),
-                   self.get_option('exclude_markers', []).split(' ')))
-        self.taskset_affinity = self.get_option('affinity', '')
 
         try:
             autostop = self.core.get_plugin_of_type(AutostopPlugin)
@@ -84,136 +68,117 @@ class Plugin(AbstractPlugin, GeneratorPlugin):
                 "No autostop plugin found, not adding instances criterion")
 
         self.predefined_phout = self.get_option(PhantomConfig.OPTION_PHOUT, '')
-        if not self.get_option(
-                self.OPTION_CONFIG, '') and self.predefined_phout:
+        if not self.get_option(self.OPTION_CONFIG, '') and self.predefined_phout:
             self.phout_import_mode = True
+        self.phantom_config = self.phantom.config_file
 
-        if not self.config and not self.phout_import_mode:
-            self.phantom = PhantomConfig(self.core)
-            self.phantom.read_config()
+    @property
+    def phantom(self):
+        """
+        :rtype: PhantomConfig
+        """
+        if not self._phantom:
+            self._phantom = PhantomConfig(self.core, self.cfg, self.stat_log)
+            self._phantom.read_config()
+        return self._phantom
+
+    @property
+    def stat_log(self):
+        if not self._stat_log:
+            self._stat_log = self.core.mkstemp(".log", "phantom_stat_")
+        return self._stat_log
+
+    def get_reader(self, parser=string_to_df):
+        if self.reader is None:
+            self.reader = FileMultiReader(self.phantom.phout_file, self.phout_finished)
+        return PhantomReader(self.reader.get_file(), parser=parser)
+
+    def get_stats_reader(self):
+        if self.stats_reader is None:
+            self.stats_reader = PhantomStatsReader(self.stat_log, self.phantom.get_info(), lambda: self.start_time)
+        return self.stats_reader
 
     def prepare_test(self):
-        aggregator = self.core.job.aggregator_plugin
-
-        if not self.config and not self.phout_import_mode:
-
-            # generate config
-            self.config = self.phantom.compose_config()
-            args = [self.phantom_path, 'check', self.config]
-
-            try:
-                result = execute(args, catch_out=True)
-            except OSError:
-                raise RuntimeError("Phantom I/O engine is not installed!")
-
-            retcode = result[0]
-            if retcode:
-                raise RuntimeError(
-                    "Config check failed. Subprocess returned code %s" %
-                    retcode)
-            if result[2]:
-                raise RuntimeError(
-                    "Subprocess returned message: %s" % result[2])
-            reader = PhantomReader(self.phantom.phout_file)
-            logger.debug(
-                "Linking sample reader to aggregator."
-                " Reading samples from %s", self.phantom.phout_file)
-
-            logger.debug(
-                "Linking stats reader to aggregator."
-                " Reading stats from %s", self.phantom.stat_log)
-        else:
-            reader = PhantomReader(self.predefined_phout)
-            logger.debug(
-                "Linking sample reader to aggregator."
-                " Reading samples from %s", self.predefined_phout)
-        if aggregator:
-            aggregator.reader = reader
-            info = self.phantom.get_info()
-            aggregator.stats_reader = PhantomStatsReader(
-                self.phantom.stat_log, info)
-
-            aggregator.add_result_listener(self)
         try:
-            console = self.core.get_plugin_of_type(ConsolePlugin)
-        except Exception as ex:
-            logger.debug("Console not found: %s", ex)
-            console = None
+            retcode, stdout, stderr = execute(
+                [self.get_option("phantom_path"), 'check', self.phantom.config_file], catch_out=True
+            )
+        except OSError:
+            logger.debug("Phantom I/O engine is not installed!", exc_info=True)
+            raise OSError("Phantom I/O engine not found. \nMore information: {doc_url}".format(
+                doc_url='http://yandextank.readthedocs.io/en/latest/install.html')
+            )
+        else:
+            if retcode or stderr:
+                raise RuntimeError("Config check failed. Subprocess returned code %s. Stderr: %s" % (retcode, stderr))
 
+        logger.debug(
+            "Linking sample reader to aggregator."
+            " Reading samples from %s", self.phantom.phout_file)
+
+        logger.debug(
+            "Linking stats reader to aggregator."
+            " Reading stats from %s", self.phantom.stat_log)
+
+        self.core.job.aggregator.add_result_listener(self)
+
+        # stepping inside get_info()
         self.core.job.phantom_info = self.phantom.get_info()
 
-        if console and aggregator:
-            widget = PhantomProgressBarWidget(self)
-            console.add_info_widget(widget)
-            aggregator.add_result_listener(widget)
+        try:
+            console = self.core.get_plugin_of_type(ConsolePlugin)
+        except KeyError:
+            logger.debug("Console not found: %s", exc_info=True)
+        else:
+            widget1 = PhantomProgressBarWidget(self)
+            console.add_info_widget(widget1)
+            self.core.job.aggregator.add_result_listener(widget1)
 
-            widget = PhantomInfoWidget(self)
-            console.add_info_widget(widget)
-            aggregator = self.core.get_plugin_of_type(AggregatorPlugin)
-            aggregator.add_result_listener(widget)
+            widget2 = PhantomInfoWidget(self)
+            console.add_info_widget(widget2)
+            self.core.job.aggregator.add_result_listener(widget2)
 
     def start_test(self):
-        if not self.phout_import_mode:
-            args = [self.phantom_path, 'run', self.config]
-            logger.debug(
-                "Starting %s with arguments: %s", self.phantom_path, args)
-            if self.taskset_affinity != '':
-                args = [
-                    self.core.taskset_path, '-c', self.taskset_affinity
-                ] + args
-                logger.debug(
-                    "Enabling taskset for phantom with affinity: %s,"
-                    " cores count: %d", self.taskset_affinity, self.cpu_count)
-            self.phantom_start_time = time.time()
-            phantom_stderr_file = self.core.mkstemp(
-                ".log", "phantom_stdout_stderr_")
-            self.core.add_artifact_file(phantom_stderr_file)
-            self.phantom_stderr = open(phantom_stderr_file, 'w')
-            self.process = subprocess.Popen(
-                args,
-                stderr=self.phantom_stderr,
-                stdout=self.phantom_stderr,
-                close_fds=True)
-        else:
-            if not os.path.exists(self.predefined_phout):
-                raise RuntimeError(
-                    "Phout file not exists for import: %s" %
-                    self.predefined_phout)
-            logger.warn(
-                "Will import phout file instead of running phantom: %s",
-                self.predefined_phout)
+        args = [self.get_option("phantom_path"), 'run', self.phantom.config_file]
+        if self.affinity:
+            logger.info('Enabled cpu affinity %s for phantom', self.affinity)
+            args = self.core.__setup_affinity(self.affinity, args=args)
+        logger.debug("Starting %s with arguments: %s", self.get_option("phantom_path"), args)
+        phantom_stderr_file = self.core.mkstemp(
+            ".log", "phantom_stdout_stderr_")
+        self.core.add_artifact_file(phantom_stderr_file)
+        self.process_stderr = open(phantom_stderr_file, 'w')
+        self.start_time = time.time()
+        self.process = subprocess.Popen(
+            args,
+            stderr=self.process_stderr,
+            stdout=self.process_stderr,
+            close_fds=True)
 
     def is_test_finished(self):
-        if not self.phout_import_mode:
-            retcode = self.process.poll()
-            if retcode is not None:
-                logger.info("Phantom done its work with exit code: %s", retcode)
-                return abs(retcode)
-            else:
-                info = self.get_info()
-                if info:
-                    eta = int(info.duration) - (
-                        int(time.time()) - int(self.phantom_start_time))
-                    self.publish('eta', eta)
-                return -1
+        retcode = self.process.poll()
+        if retcode is not None:
+            logger.info("Phantom done its work with exit code: %s", retcode)
+            self.phout_finished.set()
+            return abs(retcode)
         else:
-            if not self.processed_ammo_count or self.did_phout_import_try != self.processed_ammo_count:
-                self.did_phout_import_try = self.processed_ammo_count
-                return -1
-            else:
-                return 0
+            info = self.get_info()
+            if info:
+                eta = int(info.duration) - (int(time.time()) - int(self.start_time))
+                self.publish('eta', eta)
+            return -1
 
     def end_test(self, retcode):
         if self.process and self.process.poll() is None:
-            logger.warn(
-                "Terminating phantom process with PID %s", self.process.pid)
+            logger.info("Terminating phantom process with PID %s", self.process.pid)
             self.process.terminate()
             if self.process:
                 self.process.communicate()
         else:
             logger.debug("Seems phantom finished OK")
-        if self.phantom_stderr:
-            self.phantom_stderr.close()
+        self.phout_finished.set()
+        if self.process_stderr:
+            self.process_stderr.close()
         return retcode
 
     def post_process(self, retcode):

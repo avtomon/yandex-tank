@@ -1,6 +1,11 @@
 import pandas as pd
 import time
 import itertools as itt
+from queue import Empty
+from threading import Lock
+import threading as th
+import logging
+logger = logging.getLogger(__name__)
 
 
 def records_to_df(records):
@@ -14,31 +19,45 @@ def records_to_df(records):
 
 
 def _expand_steps(steps):
-    return list(itt.chain(* [[rps] * int(duration) for rps, duration in steps]))
+    return list(itt.chain(
+        * [[rps] * int(duration) for rps, duration in steps]))
 
 
 class BfgReader(object):
-    def __init__(self, results):
+    def __init__(self, results, closed):
         self.buffer = ""
         self.stat_buffer = ""
         self.results = results
-        self.closed = False
+        self.closed = closed
+        self.records = []
+        self.lock = Lock()
+        self.thread = th.Thread(target=self._cacher)
+        self.thread.start()
+
+    def _cacher(self):
+        while True:
+            try:
+                self.records.append(
+                    self.results.get(block=False))
+            except Empty:
+                if not self.closed.is_set():
+                    time.sleep(0.1)
+                else:
+                    break
 
     def next(self):
-        if self.closed:
+        if self.closed.is_set():
+            self.thread.join()
             raise StopIteration
-        records = []
-        while not self.results.empty():
-            records.append(self.results.get(1))
+        with self.lock:
+            records = self.records
+            self.records = []
         if records:
             return records_to_df(records)
         return None
 
     def __iter__(self):
         return self
-
-    def close(self):
-        self.closed = True
 
 
 class BfgStatsReader(object):
