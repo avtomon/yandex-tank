@@ -9,41 +9,47 @@ import json
 import logging
 import os
 import time
-from ...common.resource import manager as resource
-from ...common.interfaces import MonitoringDataListener, \
-    AbstractPlugin, AbstractInfoWidget
-from ...common.util import expand_to_seconds
+import sys
 
+from copy import deepcopy
+
+from netort.resource import manager as resource
+
+from yandextank.plugins.DataUploader.client import LPRequisites
+from ...common.interfaces import MonitoringDataListener, AbstractInfoWidget, MonitoringPlugin
+from ...common.util import expand_to_seconds
 from ..Autostop import Plugin as AutostopPlugin, AbstractCriterion
 from ..Console import Plugin as ConsolePlugin
 from ..Telegraf.collector import MonitoringCollector
 
-import sys
 if sys.version_info[0] < 3:
     from ConfigParser import NoOptionError
 else:
     from configparser import NoOptionError
 
+
 logger = logging.getLogger(__name__)
 
 
-class Plugin(AbstractPlugin):
+class Plugin(MonitoringPlugin):
     """  resource mon plugin  """
 
     SECTION = 'telegraf'  # may be redefined to 'monitoring' sometimes.
 
-    def __init__(self, core):
-        super(Plugin, self).__init__(core)
+    def __init__(self, core, cfg, name):
+        super(Plugin, self).__init__(core, cfg, name)
         self.jobno = None
         self.default_target = None
         self.default_config = "{path}/config/monitoring_default_config.xml".format(
             path=os.path.dirname(__file__))
-        self.config = None
         self.process = None
-        self.monitoring = MonitoringCollector()
+        self.monitoring = MonitoringCollector(
+            disguise_hostnames=self.get_option('disguise_hostnames'),
+            kill_old=self.get_option('kill_old'))
         self.die_on_fail = True
         self.data_file = None
         self.mon_saver = None
+        self._config = None
 
     @staticmethod
     def get_key():
@@ -56,7 +62,12 @@ class Plugin(AbstractPlugin):
                 "load_start_time = %s", self.monitoring.load_start_time)
 
     def get_available_options(self):
-        return ["config", "default_target", "ssh_timeout"]
+        return [
+            "config",
+            "default_target",
+            "ssh_timeout",
+            "disguise_hostnames"
+        ]
 
     def __detect_configuration(self):
         """
@@ -66,12 +77,12 @@ class Plugin(AbstractPlugin):
         :return: SECTION name or None for defaults
         """
         try:
-            is_telegraf = self.core.get_option('telegraf', "config", None)
-        except NoOptionError:
+            is_telegraf = self.core.get_option('telegraf', "config")
+        except KeyError:
             is_telegraf = None
         try:
-            is_monitoring = self.core.get_option('monitoring', "config", None)
-        except NoOptionError:
+            is_monitoring = self.core.get_option('monitoring', "config")
+        except KeyError:
             is_monitoring = None
 
         if is_telegraf and is_monitoring:
@@ -85,14 +96,12 @@ class Plugin(AbstractPlugin):
         if not is_telegraf and not is_monitoring:
             # defaults target logic
             try:
-                is_telegraf_dt = self.core.get_option(
-                    'telegraf', "default_target", None)
+                is_telegraf_dt = self.core.get_option('telegraf')
             except NoOptionError:
                 is_telegraf_dt = None
             try:
-                is_monitoring_dt = self.core.get_option(
-                    'monitoring', "default_target", None)
-            except:
+                is_monitoring_dt = self.core.get_option('monitoring')
+            except BaseException:
                 is_monitoring_dt = None
             if is_telegraf_dt and is_monitoring_dt:
                 raise ValueError(
@@ -106,49 +115,59 @@ class Plugin(AbstractPlugin):
             if not is_telegraf_dt and not is_monitoring_dt:
                 return
 
+    @property
+    def config(self):
+        """
+
+        :rtype: str
+        """
+        if self._config is None:
+            value = self.get_option('config')
+
+            if value.lower() == "none":
+                self.monitoring = None
+                self.die_on_fail = False
+                self._config = value
+            # handle http/https url or file path
+            else:
+                if value.startswith("<"):
+                    config_contents = value
+                elif value.lower() == "auto":
+                    self.die_on_fail = False
+                    with open(resource.resource_filename(self.default_config), 'rb') as def_config:
+                        config_contents = def_config.read()
+                else:
+                    with open(resource.resource_filename(value), 'rb') as config:
+                        config_contents = config.read()
+                self._config = self._save_config_contents(config_contents)
+        return self._config
+
+    def _save_config_contents(self, contents):
+        xmlfile = self.core.mkstemp(".xml", "monitoring_")
+        self.core.add_artifact_file(xmlfile)
+        with open(xmlfile, "wb") as f:  # output file should be in binary mode to support py3
+            f.write(contents)
+        return xmlfile
+
     def configure(self):
         self.detected_conf = self.__detect_configuration()
         if self.detected_conf:
-            logging.info(
+            logger.info(
                 'Detected monitoring configuration: %s', self.detected_conf)
             self.SECTION = self.detected_conf
-        self.config = self.get_option("config", "auto").strip()
         self.default_target = self.get_option("default_target", "localhost")
         if self.config.lower() == "none":
             self.monitoring = None
             self.die_on_fail = False
             return
 
+        with open(self.config) as f:
+            self.core.add_artifact_to_send(LPRequisites.MONITORING, unicode(f.read()))
+
         # FIXME [legacy] backward compatibility with Monitoring module
         # configuration below.
         self.monitoring.ssh_timeout = expand_to_seconds(
             self.get_option("ssh_timeout", "5s"))
-
-        # FIXME [legacy] handle raw XML config in .ini file
-        if self.config[0] == "<":
-            config_contents = self.config
-        # handle http/https url or file path
-        else:
-            if self.config.lower() == "auto":
-                self.die_on_fail = False
-                with open(
-                        resource.resource_filename(self.default_config),
-                        'rb') as def_config:
-                    config_contents = def_config.read()
-            else:
-                with open(resource.resource_filename(self.config),
-                          'rb') as config:
-                    config_contents = config.read()
-
-        # dump config contents into a file
-        xmlfile = self.core.mkstemp(".xml", "monitoring_")
-        self.core.add_artifact_file(xmlfile)
-        with open(
-                xmlfile, "wb"
-        ) as f:  # output file should be in binary mode to support py3
-            f.write(config_contents)
-        self.config = xmlfile
-
         try:
             autostop = self.core.get_plugin_of_type(AutostopPlugin)
             autostop.add_criterion_class(MetricHigherCriterion)
@@ -163,10 +182,6 @@ class Plugin(AbstractPlugin):
 
         if "Phantom" in self.core.job.generator_plugin.__module__:
             phantom = self.core.job.generator_plugin
-            if phantom.phout_import_mode:
-                logger.info("Phout import mode, disabling monitoring")
-                self.config = None
-                self.monitoring = None
 
             info = phantom.get_info()
             if info:
@@ -177,12 +192,6 @@ class Plugin(AbstractPlugin):
         self.monitoring.config = self.config
         if self.default_target:
             self.monitoring.default_target = self.default_target
-
-        # FIXME json report already save this artifact, fix pls
-        self.data_file = self.core.mkstemp(".data", "monitoring_overall_")
-        self.mon_saver = SaveMonToFile(self.data_file)
-        self.monitoring.add_listener(self.mon_saver)
-        self.core.add_artifact_file(self.data_file)
 
         try:
             console = self.core.get_plugin_of_type(ConsolePlugin)
@@ -197,22 +206,27 @@ class Plugin(AbstractPlugin):
         try:
             self.monitoring.prepare()
             self.monitoring.start()
+            self.add_cleanup(self.monitoring.stop)
             count = 0
             while not self.monitoring.first_data_received and count < 15 * 5:
                 time.sleep(0.2)
                 self.monitoring.poll()
                 count += 1
-        except:
+        except BaseException:
             logger.error("Could not start monitoring", exc_info=True)
             if self.die_on_fail:
                 raise
             else:
                 self.monitoring = None
 
+    def add_listener(self, plugin):
+        return self.monitoring.add_listener(plugin)
+
     def is_test_finished(self):
         if self.monitoring:
-            data_len = self.monitoring.poll()
-            logger.debug("Monitoring got %s lines", data_len)
+            monitoring_data = self.monitoring.poll()
+            logger.debug("Monitoring got %s lines", len(monitoring_data))
+            self.core.publish_monitoring_data(monitoring_data)
         return -1
 
     def end_test(self, retcode):
@@ -222,11 +236,12 @@ class Plugin(AbstractPlugin):
             for log in self.monitoring.artifact_files:
                 self.core.add_artifact_file(log)
 
-            while self.monitoring.send_data:
-                logger.info("Sending monitoring data rests...")
-                self.monitoring.send_collected_data()
+            self.core.publish_monitoring_data(self.monitoring.get_rest_data())
         if self.mon_saver:
             self.mon_saver.close()
+        return retcode
+
+    def post_process(self, retcode):
         return retcode
 
 
@@ -325,13 +340,11 @@ class MonitoringWidget(AbstractInfoWidget, MonitoringDataListener):
             return "Monitoring is " + screen.markup.RED + "offline" + screen.markup.RESET
         else:
             res = "Monitoring is " + screen.markup.GREEN + \
-                "online" + screen.markup.RESET + ":\n"
+                  "online" + screen.markup.RESET + ":\n"
             for hostname, metrics in self.data.items():
                 tm_stamp = datetime.datetime.fromtimestamp(
                     float(self.time[hostname])).strftime('%H:%M:%S')
-                res += (
-                    "   " + screen.markup.CYAN + "%s" + screen.markup.RESET +
-                    " at %s:\n") % (hostname, tm_stamp)
+                res += ("   " + screen.markup.CYAN + "%s" + screen.markup.RESET + " at %s:\n") % (hostname, tm_stamp)
                 for metric, value in sorted(metrics.iteritems()):
                     if self.sign[hostname][metric] > 0:
                         value = screen.markup.YELLOW + value + screen.markup.RESET
@@ -365,10 +378,11 @@ class AbstractMetricCriterion(AbstractCriterion, MonitoringDataListener):
         self.last_second = None
         self.seconds_count = 0
 
-    def monitoring_data(self, block):
+    def monitoring_data(self, _block):
         if self.triggered:
             return
 
+        block = deepcopy(_block)
         for chunk in block:
             host = chunk['data'].keys()[0]
             data = chunk['data'][host]['metrics']

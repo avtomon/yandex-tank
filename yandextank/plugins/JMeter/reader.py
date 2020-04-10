@@ -1,12 +1,13 @@
 # -*- coding: UTF-8 -*-
-import pandas as pd
-import numpy as np
-import queue as q
 import logging
 from StringIO import StringIO
 
-from ..Aggregator import aggregator as agg
-from ..Aggregator.chopper import TimeChopper
+import numpy as np
+import pandas as pd
+import queue as q
+
+from yandextank.aggregator import TimeChopper
+from yandextank.aggregator import aggregator as agg
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def _exc_to_http(param1):
     if len(param1) <= 3:
         try:
             int(param1)
-        except:
+        except BaseException:
             logger.error(
                 "JMeter wrote some strange data into codes column: %s", param1)
         else:
@@ -111,22 +112,23 @@ def fix_latency(row):
 
 # timeStamp,elapsed,label,responseCode,success,bytes,grpThreads,allThreads,Latency
 def string_to_df(data):
-    chunk = pd.read_csv(
-        StringIO(data), sep='\t', names=jtl_columns, dtype=jtl_types)
+    chunk = pd.read_csv(StringIO(data),
+                        sep='\t',
+                        names=jtl_columns, dtype=jtl_types,
+                        keep_default_na=False)
     chunk["receive_ts"] = (chunk["send_ts"] + chunk['interval_real']) / 1000.0
     chunk['receive_sec'] = chunk["receive_ts"].astype(np.int64)
     chunk['interval_real'] = chunk["interval_real"] * 1000  # convert to µs
     chunk.set_index(['receive_sec'], inplace=True)
-    l = len(chunk)
-    chunk['connect_time'] = (chunk['connect_time'].fillna(0) *
-                             1000).astype(np.int64)
+    chunk_length = len(chunk)
+    chunk['connect_time'] = (chunk['connect_time'].fillna(0) * 1000).astype(np.int64)
     chunk['latency'] = chunk['latency'] * 1000
     chunk['latency'] = chunk.apply(fix_latency, axis=1)
-    chunk['send_time'] = np.zeros(l)
+    chunk['send_time'] = np.zeros(chunk_length)
     chunk['receive_time'] = chunk['interval_real'] - \
         chunk['latency'] - chunk['connect_time']
-    chunk['interval_event'] = np.zeros(l)
-    chunk['size_out'] = np.zeros(l).astype(int)
+    chunk['interval_event'] = np.zeros(chunk_length)
+    chunk['size_out'] = np.zeros(chunk_length).astype(int)
     chunk['net_code'] = exc_to_net(chunk['retcode'], chunk['success'])
     chunk['proto_code'] = exc_to_http(chunk['retcode'])
     return chunk
@@ -138,7 +140,7 @@ class JMeterStatAggregator(object):
         self.source = source
 
     def __iter__(self):
-        for ts, chunk in self.source:
+        for ts, chunk, rps in self.source:
             stats = self.worker.aggregate(chunk)
             yield [{
                 'ts': ts,
@@ -166,13 +168,13 @@ class JMeterReader(object):
 
     def _read_stat_queue(self):
         while not self.closed:
-            for _ in range(self.stat_queue.qsize()):
-                try:
-                    si = self.stat_queue.get_nowait()
-                    if si is not None:
-                        yield si
-                except q.Empty:
-                    break
+            # for _ in range(self.stat_queue.qsize()):
+            try:
+                si = self.stat_queue.get_nowait()
+                if si is not None:
+                    yield si
+            except q.Empty:
+                pass
 
     def _read_jtl_chunk(self, jtl):
         data = jtl.read(1024 * 1024 * 10)

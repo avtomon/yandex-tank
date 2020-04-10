@@ -1,16 +1,27 @@
 """ Provides classes to run TankCore from console environment """
-import datetime
 import fnmatch
+import glob
 import logging
 import os
+import shutil
+import signal
+import stat
 import sys
 import time
 import traceback
-import signal
-from optparse import OptionParser
+from ConfigParser import ConfigParser, MissingSectionHeaderError, NoOptionError, NoSectionError
+from threading import Thread, Event
+
+import yaml
+from netort.resource import manager as resource_manager
 from pkg_resources import resource_filename
 
-from .tankcore import TankCore
+from yandextank.validator.validator import ValidationError
+from .tankcore import TankCore, LockError, Lock
+from ..config_converter.converter import convert_ini, convert_single_option
+
+DEFAULT_CONFIG = 'load.yaml'
+logger = logging.getLogger()
 
 
 class RealConsoleMarkup(object):
@@ -38,27 +49,12 @@ class RealConsoleMarkup(object):
     def clean_markup(self, orig_str):
         ''' clean markup from string '''
         for val in [
-                self.YELLOW, self.RED, self.RESET, self.CYAN, self.BG_MAGENTA,
-                self.WHITE, self.BG_GREEN, self.GREEN, self.BG_BROWN,
-                self.RED_DARK, self.MAGENTA, self.BG_CYAN
+            self.YELLOW, self.RED, self.RESET, self.CYAN, self.BG_MAGENTA,
+            self.WHITE, self.BG_GREEN, self.GREEN, self.BG_BROWN,
+            self.RED_DARK, self.MAGENTA, self.BG_CYAN
         ]:
             orig_str = orig_str.replace(val, '')
         return orig_str
-
-
-class SingleLevelFilter(logging.Filter):
-    """Exclude or approve one msg type at a time.    """
-
-    def __init__(self, passlevel, reject):
-        logging.Filter.__init__(self)
-        self.passlevel = passlevel
-        self.reject = reject
-
-    def filter(self, record):
-        if self.reject:
-            return record.levelno != self.passlevel
-        else:
-            return record.levelno == self.passlevel
 
 
 def signal_handler(sig, frame):
@@ -70,252 +66,405 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-class ConsoleTank:
-    """    Worker class that runs tank core accepting cmdline params    """
+def load_cfg(cfg_filename):
+    """
 
-    IGNORE_LOCKS = "ignore_locks"
+    :type cfg_filename: str
+    """
+    if is_ini(cfg_filename):
+        return convert_ini(cfg_filename)
+    else:
+        with open(cfg_filename) as f:
+            return yaml.load(f, Loader=yaml.FullLoader)
 
-    def __init__(self, options, ammofile):
-        self.core = TankCore()
 
-        self.options = options
-        self.ammofile = ammofile
+def cfg_folder_loader(path):
+    """
+    :type path: str
+    """
+    CFG_WILDCARD = '*.yaml'
+    return [load_cfg(filename) for filename in sorted(glob.glob(os.path.join(path, CFG_WILDCARD)))]
 
-        self.baseconfigs_location = '/etc/yandex-tank'
 
-        self.log_filename = self.options.log
-        self.core.add_artifact_file(self.log_filename)
-        self.log = logging.getLogger(__name__)
+def load_core_base_cfg():
+    return load_cfg(resource_filename(__name__, 'config/00-base.yaml'))
 
-        self.signal_count = 0
-        self.scheduled_start = None
 
-    def set_baseconfigs_dir(self, directory):
-        """        Set directory where to read configs set        """
-        self.baseconfigs_location = directory
+def load_local_base_cfgs():
+    return cfg_folder_loader('/etc/yandex-tank')
 
-    def init_logging(self):
-        """ Set up logging, as it is very important for console tool """
-        logger = logging.getLogger('')
-        logger.setLevel(logging.DEBUG)
 
-        # create file handler which logs even debug messages
-        if self.log_filename:
-            file_handler = logging.FileHandler(self.log_filename)
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(
-                logging.Formatter(
-                    "%(asctime)s [%(levelname)s] %(name)s %(filename)s:%(lineno)d\t%(message)s"
-                ))
-            logger.addHandler(file_handler)
+def parse_options(options):
+    """
+    :type options: list of str
+    :rtype: list of dict
+    """
+    if options is None:
+        return []
+    else:
+        return [
+            convert_single_option(key.strip(), value.strip())
+            for key, value
+            in [option.split('=', 1) for option in options]
+        ]
 
-        # create console handler with a higher log level
-        console_handler = logging.StreamHandler(sys.stdout)
-        stderr_hdl = logging.StreamHandler(sys.stderr)
 
-        fmt_verbose = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s %(filename)s:%(lineno)d\t%(message)s"
-        )
-        fmt_regular = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+def apply_shorthand_options(config, options, default_section='DEFAULT'):
+    """
 
-        if self.options.verbose:
-            console_handler.setLevel(logging.DEBUG)
-            console_handler.setFormatter(fmt_verbose)
-            stderr_hdl.setFormatter(fmt_verbose)
-        elif self.options.quiet:
-            console_handler.setLevel(logging.WARNING)
-            console_handler.setFormatter(fmt_regular)
-            stderr_hdl.setFormatter(fmt_regular)
-        else:
-            console_handler.setLevel(logging.INFO)
-            console_handler.setFormatter(fmt_regular)
-            stderr_hdl.setFormatter(fmt_regular)
-
-        f_err = SingleLevelFilter(logging.ERROR, True)
-        f_warn = SingleLevelFilter(logging.WARNING, True)
-        f_crit = SingleLevelFilter(logging.CRITICAL, True)
-        console_handler.addFilter(f_err)
-        console_handler.addFilter(f_warn)
-        console_handler.addFilter(f_crit)
-        logger.addHandler(console_handler)
-
-        f_info = SingleLevelFilter(logging.INFO, True)
-        f_debug = SingleLevelFilter(logging.DEBUG, True)
-        stderr_hdl.addFilter(f_info)
-        stderr_hdl.addFilter(f_debug)
-        logger.addHandler(stderr_hdl)
-
-    def __override_config_from_cmdline(self):
-        """ override config options from command line"""
-        if self.options.option:
-            self.core.apply_shorthand_options(self.options.option)
-
-    def get_default_configs(self):
-        """ returns default configs list, from /etc and home dir """
-        # initialize basic defaults
-        configs = [resource_filename(__name__, 'config/00-base.ini')]
+    :type config: ConfigParser
+    """
+    if not options:
+        return config
+    for option_str in options:
+        key, value = option_str.split('=')
         try:
-            conf_files = sorted(os.listdir(self.baseconfigs_location))
-            for filename in conf_files:
-                if fnmatch.fnmatch(filename, '*.ini'):
-                    configs += [
-                        os.path.realpath(
-                            self.baseconfigs_location + os.sep + filename)
-                    ]
-        except OSError:
-            self.log.warn(
-                self.baseconfigs_location +
-                ' is not accessible to get configs list')
+            section, option = key.split('.')
+        except ValueError:
+            section = default_section
+            option = key
+        if not config.has_section(section):
+            config.add_section(section)
+        config.set(section, option, value)
+    return config
 
-        configs += [os.path.expanduser('~/.yandex-tank')]
+
+def load_ini_cfgs(config_files):
+    config_filenames = [resource_manager.resource_filename(config) for config in config_files]
+    cfg = ConfigParser()
+    cfg.read(config_filenames)
+
+    dotted_options = []
+    if cfg.has_section('tank'):
+        for option, value in cfg.items('tank'):
+            if '.' in option:
+                dotted_options += [option + '=' + value]
+    else:
+        cfg.add_section('tank')
+    cfg = apply_shorthand_options(cfg, dotted_options)
+    cfg.set('tank', 'pid', str(os.getpid()))
+    return cfg
+
+
+def get_default_configs():
+    """ returns default configs list, from /etc and home dir """
+    # initialize basic defaults
+    configs = [resource_filename(__name__, 'config/00-base.ini')]
+    baseconfigs_location = '/etc/yandex-tank'
+    try:
+        conf_files = sorted(os.listdir(baseconfigs_location))
+        for filename in conf_files:
+            if fnmatch.fnmatch(filename, '*.ini'):
+                configs += [
+                    os.path.realpath(
+                        baseconfigs_location + os.sep + filename)
+                ]
+    except OSError:
+        logger.info(
+            baseconfigs_location + ' is not accessible to get configs list')
+
+    configs += [os.path.expanduser('~/.yandex-tank')]
+    return configs
+
+
+def is_ini(cfg_file):
+    if cfg_file.endswith('.yaml') or cfg_file.endswith('.json'):
+        return False
+    try:
+        ConfigParser().read(cfg_file)
+        return True
+    except MissingSectionHeaderError:
+        return False
+
+
+def get_depr_cfg(config_files, no_rc, cmd_options, depr_options):
+    try:
+        all_config_files = []
+
+        if not no_rc:
+            all_config_files = get_default_configs()
+
+        if not config_files:
+            if os.path.exists(os.path.realpath('load.ini')):
+                all_config_files += [os.path.realpath('load.ini')]
+            elif os.path.exists(os.path.realpath('load.conf')):
+                # just for old 'lunapark' compatibility
+                conf_file = os.path.realpath('load.conf')
+                all_config_files += [conf_file]
+        else:
+            for config_file in config_files:
+                all_config_files.append(config_file)
+
+        cfg_ini = load_ini_cfgs([cfg_file for cfg_file in all_config_files if is_ini(cfg_file)])
+
+        # substitute telegraf config
+        def patch_ini_config_with_monitoring(ini_config, mon_section_name):
+            """
+            :type ini_config: ConfigParser
+            """
+            CONFIG = 'config'
+            telegraf_cfg = ini_config.get(mon_section_name, CONFIG)
+            if not telegraf_cfg.startswith('<') and not telegraf_cfg.lower() == 'auto':
+                with open(resource_manager.resource_filename(telegraf_cfg), 'rb') as telegraf_cfg_file:
+                    config_contents = telegraf_cfg_file.read()
+                ini_config.set(mon_section_name, CONFIG, config_contents)
+            return ini_config
+
+        try:
+            cfg_ini = patch_ini_config_with_monitoring(cfg_ini, 'monitoring')
+        except (NoSectionError, NoOptionError):
+            try:
+                patch_ini_config_with_monitoring(cfg_ini, 'telegraf')
+            except (NoOptionError, NoSectionError):
+                pass
+
+        for section, key, value in depr_options:
+            if not cfg_ini.has_section(section):
+                cfg_ini.add_section(section)
+            cfg_ini.set(section, key, value)
+        return apply_shorthand_options(cfg_ini, cmd_options)
+    except Exception as ex:
+        sys.stderr.write(RealConsoleMarkup.RED)
+        sys.stderr.write(RealConsoleMarkup.RESET)
+        sys.stderr.write(RealConsoleMarkup.TOTAL_RESET)
+        raise ex
+
+
+def parse_and_check_patches(patches):
+    parsed = [yaml.load(p) for p in patches]
+    for patch in parsed:
+        if not isinstance(patch, dict):
+            raise ValidationError('Config patch "{}" should be a dict'.format(patch))
+    return parsed
+
+
+class Cleanup:
+    def __init__(self, tankworker):
+        """
+
+        :type tankworker: TankWorker
+        """
+        self._actions = []
+        self.tankworker = tankworker
+
+    def add_action(self, name, fn):
+        """
+
+        :type fn: function
+        :type name: str
+        """
+        assert callable(fn)
+        self._actions.append((name, fn))
+
+    def __enter__(self):
+        return self.add_action
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        msgs = []
+        if exc_type:
+            msg = 'Exception occurred:\n{}: {}\n{}'.format(exc_type, exc_val, '\n'.join(traceback.format_tb(exc_tb)))
+            msgs.append(msg)
+            logger.error(msg)
+        logger.info('Trying to clean up')
+        for name, action in reversed(self._actions):
+            try:
+                action()
+            except Exception:
+                msg = 'Exception occurred during cleanup action {}'.format(name)
+                msgs.append(msg)
+                logger.error(msg, exc_info=True)
+        self.tankworker.save_finish_status('\n'.join(msgs))
+        self.tankworker.core._collect_artifacts()
+        return False  # re-raise exception
+
+
+class Finish:
+    def __init__(self, tankworker):
+        """
+        :type tankworker: TankWorker
+        """
+        self.worker = tankworker
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.worker.status = Status.TEST_FINISHING
+        retcode = self.worker.retcode
+        if exc_type:
+            logger.error('Test interrupted:\n{}: {}\n{}'.format(exc_type, exc_val, '\n'.join(traceback.format_tb(exc_tb))))
+            retcode = 1
+        retcode = self.worker.core.plugins_end_test(retcode)
+        self.worker.retcode = retcode
+        return True  # swallow exception & proceed to post-processing
+
+
+class Status():
+    TEST_POST_PROCESS = 'POST_PROCESS'
+    TEST_INITIATED = 'INITIATED'
+    TEST_PREPARING = "PREPARING"
+    TEST_NOT_FOUND = "NOT_FOUND"
+    TEST_RUNNING = "RUNNING"
+    TEST_FINISHING = "FINISHING"
+    TEST_FINISHED = "FINISHED"
+
+
+class TankWorker(Thread):
+    SECTION = 'core'
+    FINISH_FILENAME = 'finish_status.yaml'
+
+    def __init__(self, configs, cli_options=None, cfg_patches=None, cli_args=None, no_local=False,
+                 log_handlers=None, wait_lock=False, files=None, ammo_file=None, api_start=False):
+        super(TankWorker, self).__init__()
+        self.daemon = True
+        self.api_start = api_start
+        self.wait_lock = wait_lock
+        self.log_handlers = log_handlers if log_handlers is not None else []
+        self.files = [] if files is None else files
+        self.ammo_file = ammo_file
+
+        self.interrupted = Event()
+        self.config_list = self._combine_configs(configs, cli_options, cfg_patches, cli_args, no_local)
+        self.core = TankCore(self.config_list, self.interrupted)
+        self.folder = self.init_folder()
+        self.init_logging(debug=True)
+        self.status = Status.TEST_INITIATED
+        self.test_id = self.core.test_id
+        is_locked = Lock.is_locked(self.core.lock_dir)
+        if is_locked and not self.core.config.get_option(self.SECTION, 'ignore_lock'):
+            raise LockError(is_locked)
+        self.retcode = None
+        self.msg = ''
+
+    @staticmethod
+    def _combine_configs(run_cfgs, cli_options=None, cfg_patches=None, cli_args=None, no_local=False):
+        if cli_options is None:
+            cli_options = []
+        if cfg_patches is None:
+            cfg_patches = []
+        if cli_args is None:
+            cli_args = []
+        run_cfgs = run_cfgs if len(run_cfgs) > 0 else [DEFAULT_CONFIG]
+
+        if no_local:
+            configs = [load_cfg(cfg) for cfg in run_cfgs] + \
+                parse_options(cli_options) + \
+                parse_and_check_patches(cfg_patches) + \
+                cli_args
+        else:
+            configs = [load_core_base_cfg()] + \
+                load_local_base_cfgs() + \
+                [load_cfg(cfg) for cfg in run_cfgs] + \
+                parse_options(cli_options) + \
+                parse_and_check_patches(cfg_patches) + \
+                cli_args
         return configs
 
-    def configure(self):
-        """ Make all console-specific preparations before running Tank """
-        if self.options.ignore_lock:
-            self.log.warn(
-                "Lock files ignored. This is highly unrecommended practice!")
+    def init_folder(self):
+        folder = self.core.artifacts_dir
+        if self.api_start > 0:
+            for f in self.files:
+                shutil.move(f, folder)
+            if self.ammo_file:
+                shutil.move(self.ammo_file, folder)
+            os.chdir(folder)
+        return folder
 
-        if self.options.lock_dir:
-            self.core.set_option(
-                self.core.SECTION, "lock_dir", self.options.lock_dir)
+    def run(self):
+        with Cleanup(self) as add_cleanup:
+            lock = self.get_lock()
+            add_cleanup('release lock', lock.release)
+            self.status = Status.TEST_PREPARING
+            logger.info('Created a folder for the test. %s' % self.folder)
 
-        while True:
+            self.core.plugins_configure()
+            add_cleanup('plugins cleanup', self.core.plugins_cleanup)
+            self.core.plugins_prepare_test()
+            with Finish(self):
+                self.status = Status.TEST_RUNNING
+                self.core.plugins_start_test()
+                self.retcode = self.core.wait_for_finish()
+            self.status = Status.TEST_POST_PROCESS
+            self.retcode = self.core.plugins_post_process(self.retcode)
+
+    def stop(self):
+        self.interrupted.set()
+        logger.warning('Interrupting')
+
+    def get_status(self, finish=False):
+        return {'status_code': self.status if not finish else Status.TEST_FINISHED,
+                'left_time': None,
+                'exit_code': self.retcode if finish else None,
+                'lunapark_id': self.get_lunapark_jobno(),
+                'tank_msg': self.msg,
+                'lunapark_url': self.get_lunapark_link()}
+
+    def save_finish_status(self, msg):
+        self.msg = msg
+        with open(os.path.join(self.folder, self.FINISH_FILENAME), 'w') as f:
+            yaml.dump(self.get_status(finish=True), f)
+
+    def get_lunapark_jobno(self):
+        try:
+            return str(self.core.status['uploader']['job_no'])
+        except KeyError:
+            logger.warning('Job number is not available yet')
+            return None
+
+    def get_lunapark_link(self):
+        try:
+            return str(self.core.status['uploader']['web_link'])
+        except KeyError:
+            logger.warning('Job number is not available yet')
+            return None
+
+    def init_logging(self, debug=False):
+
+        filename = os.path.join(self.core.artifacts_dir, 'tank.log')
+        open(filename, 'a').close()
+        current_file_mode = os.stat(filename).st_mode
+        os.chmod(filename, current_file_mode | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+
+        logger.handlers = []
+        logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
+        file_handler = logging.FileHandler(filename)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s %(filename)s:%(lineno)d\t%(message)s"))
+        file_handler.addFilter(TankapiLogFilter())
+        logger.addHandler(file_handler)
+        logger.info("Log file created")
+
+        for handler in self.log_handlers:
+            logger.addHandler(handler)
+            logger.info("Logging handler {} added".format(handler))
+
+    def get_lock(self):
+        while not self.interrupted.is_set():
             try:
-                self.core.get_lock(self.options.ignore_lock)
+                lock = Lock(self.test_id, self.folder).acquire(self.core.lock_dir,
+                                                               self.core.config.get_option(self.SECTION, 'ignore_lock'))
+                self.set_msg('')
                 break
-            except Exception:
-                if self.options.lock_fail:
+            except LockError as e:
+                self.set_msg(e.message)
+                if not self.wait_lock:
                     raise RuntimeError("Lock file present, cannot continue")
-                self.log.exception(
+                logger.warning(
                     "Couldn't get lock. Will retry in 5 seconds...")
                 time.sleep(5)
+        else:
+            raise KeyboardInterrupt
+        return lock
 
-        try:
-            configs = []
+    def set_msg(self, msg):
+        self.msg = msg
 
-            if not self.options.no_rc:
-                configs = self.get_default_configs()
 
-            if not self.options.config:
-                if os.path.exists(os.path.realpath('load.ini')):
-                    self.log.info(
-                        "No config passed via cmdline, using ./load.ini")
-                    configs += [os.path.realpath('load.ini')]
-                    self.core.add_artifact_file(
-                        os.path.realpath('load.ini'), True)
-                elif os.path.exists(os.path.realpath('load.conf')):
-                    # just for old 'lunapark' compatibility
-                    self.log.warn(
-                        "Using 'load.conf' is unrecommended, please use 'load.ini' instead"
-                    )
-                    conf_file = os.path.realpath('load.conf')
-                    configs += [conf_file]
-                    self.core.add_artifact_file(conf_file, True)
-            else:
-                for config_file in self.options.config:
-                    configs.append(config_file)
-
-            self.core.load_configs(configs)
-
-            if self.ammofile:
-                self.log.debug("Ammofile: %s", self.ammofile)
-                self.core.set_option("phantom", 'ammofile', self.ammofile[0])
-
-            self.__override_config_from_cmdline()
-
-            self.core.load_plugins()
-
-            if self.options.scheduled_start:
-                try:
-                    self.scheduled_start = datetime.datetime.strptime(
-                        self.options.scheduled_start, '%Y-%m-%d %H:%M:%S')
-                except ValueError:
-                    self.scheduled_start = datetime.datetime.strptime(
-                        datetime.datetime.now().strftime('%Y-%m-%d ') +
-                        self.options.scheduled_start, '%Y-%m-%d %H:%M:%S')
-
-            if self.options.ignore_lock:
-                self.core.set_option(self.core.SECTION, self.IGNORE_LOCKS, "1")
-
-        except Exception as ex:
-            self.log.info("Exception: %s", traceback.format_exc(ex))
-            sys.stderr.write(RealConsoleMarkup.RED)
-            self.log.error("%s", ex)
-            sys.stderr.write(RealConsoleMarkup.RESET)
-            sys.stderr.write(RealConsoleMarkup.TOTAL_RESET)
-            self.core.release_lock()
-            raise ex
-
-    def __graceful_shutdown(self):
-        """ call shutdown routines """
-        retcode = 1
-        self.log.info("Trying to shutdown gracefully...")
-        retcode = self.core.plugins_end_test(retcode)
-        retcode = self.core.plugins_post_process(retcode)
-        self.log.info("Done graceful shutdown")
-        return retcode
-
-    def perform_test(self):
-        """
-        Run the test sequence via Tank Core
-        """
-        self.log.info("Performing test")
-        retcode = 1
-        try:
-            self.core.plugins_configure()
-            self.core.plugins_prepare_test()
-            if self.scheduled_start:
-                self.log.info(
-                    "Waiting scheduled time: %s...", self.scheduled_start)
-                while datetime.datetime.now() < self.scheduled_start:
-                    self.log.debug(
-                        "Not yet: %s < %s",
-                        datetime.datetime.now(), self.scheduled_start)
-                    time.sleep(1)
-                self.log.info("Time has come: %s", datetime.datetime.now())
-
-            if self.options.manual_start:
-                raw_input("Press Enter key to start test:")
-
-            self.core.plugins_start_test()
-            retcode = self.core.wait_for_finish()
-            retcode = self.core.plugins_end_test(retcode)
-            retcode = self.core.plugins_post_process(retcode)
-
-        except KeyboardInterrupt as ex:
-            sys.stdout.write(RealConsoleMarkup.YELLOW)
-            self.log.info(
-                "Do not press Ctrl+C again, the test will be broken otherwise")
-            sys.stdout.write(RealConsoleMarkup.RESET)
-            sys.stdout.write(RealConsoleMarkup.TOTAL_RESET)
-            self.signal_count += 1
-            self.log.debug(
-                "Caught KeyboardInterrupt: %s", traceback.format_exc(ex))
-            try:
-                retcode = self.__graceful_shutdown()
-            except KeyboardInterrupt as ex:
-                self.log.debug(
-                    "Caught KeyboardInterrupt again: %s",
-                    traceback.format_exc(ex))
-                self.log.info(
-                    "User insists on exiting, aborting graceful shutdown...")
-                retcode = 1
-
-        except Exception as ex:
-            self.log.info("Exception: %s", traceback.format_exc(ex))
-            sys.stderr.write(RealConsoleMarkup.RED)
-            self.log.error("%s", ex)
-            sys.stderr.write(RealConsoleMarkup.RESET)
-            sys.stderr.write(RealConsoleMarkup.TOTAL_RESET)
-            retcode = self.__graceful_shutdown()
-            self.core.release_lock()
-        finally:
-            self.core.close()
-
-        self.log.info("Done performing test with code %s", retcode)
-        return retcode
+class TankapiLogFilter(logging.Filter):
+    def filter(self, record):
+        return record.name != 'tankapi'
 
 
 class DevNullOpts:
@@ -323,61 +472,3 @@ class DevNullOpts:
         pass
 
     log = "/dev/null"
-
-
-class CompletionHelperOptionParser(OptionParser):
-    def __init__(self):
-        OptionParser.__init__(self, add_help_option=False)
-        self.add_option(
-            '--bash-switches-list',
-            action='store_true',
-            dest="list_switches",
-            help="Options list")
-        self.add_option(
-            '--bash-options-prev',
-            action='store',
-            dest="list_options_prev",
-            help="Options list")
-        self.add_option(
-            '--bash-options-cur',
-            action='store',
-            dest="list_options_cur",
-            help="Options list")
-
-    def error(self, msg):
-        pass
-
-    def exit(self, status=0, msg=None):
-        pass
-
-    def handle_request(self, parser):
-        options = self.parse_args()[0]
-        if options.list_switches:
-            opts = []
-            for option in parser.option_list:
-                if "--bash" not in option.get_opt_string():
-                    opts.append(option.get_opt_string())
-            print ' '.join(opts)
-            exit(0)
-
-        if options.list_options_cur or options.list_options_prev:
-            cmdtank = ConsoleTank(DevNullOpts(), None)
-            cmdtank.core.load_configs(cmdtank.get_default_configs())
-            cmdtank.core.load_plugins()
-
-            opts = []
-            for option in cmdtank.core.get_available_options():
-                opts.append(cmdtank.core.SECTION + '.' + option + '=')
-
-            plugin_keys = cmdtank.core.config.get_options(
-                cmdtank.core.SECTION, cmdtank.core.PLUGIN_PREFIX)
-            for (plugin_name, plugin_path) in plugin_keys:
-                opts.append(
-                    cmdtank.core.SECTION + '.' + cmdtank.core.PLUGIN_PREFIX +
-                    plugin_name + '=')
-
-            for plugin in cmdtank.core.plugins:
-                for option in plugin.get_available_options():
-                    opts.append(plugin.SECTION + '.' + option + '=')
-            print ' '.join(sorted(opts))
-            exit(0)

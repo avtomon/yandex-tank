@@ -13,13 +13,24 @@ class AbstractPlugin(object):
         should point to __file__ magic constant """
         raise TypeError("Abstract method needs to be overridden")
 
-    def __init__(self, core):
+    # TODO: do we realy need cfg_updater here?
+    def __init__(self, core, cfg, name):
         """
 
-        @type core: TankCore
+        :param name:
+        :type core: yandextank.core.TankCore
+        :type cfg: dict
         """
+        super(AbstractPlugin, self).__init__()
+        self._cleanup_actions = []
         self.log = logging.getLogger(__name__)
         self.core = core
+        self.cfg = cfg
+        self.cfg_section_name = name
+        self.interrupted = self.core.interrupted
+
+    def set_option(self, option, value):
+        self.cfg[option] = value
 
     def configure(self):
         """ A stage to read config values and instantiate objects """
@@ -36,9 +47,23 @@ class AbstractPlugin(object):
     def is_test_finished(self):
         """
         Polling call, if result differs from -1 then test end
-        will be triggeted
+        will be triggered
         """
         return -1
+
+    def add_cleanup(self, action):
+        """
+        :type action: function
+        """
+        assert callable(action)
+        self._cleanup_actions.append(action)
+
+    def cleanup(self):
+        for action in reversed(self._cleanup_actions):
+            try:
+                action()
+            except Exception:
+                logging.error('Exception occurred during plugin cleanup {}'.format(self.__module__), exc_info=True)
 
     def end_test(self, retcode):
         """
@@ -53,11 +78,7 @@ class AbstractPlugin(object):
 
     def get_option(self, option_name, default_value=None):
         """ Wrapper to get option from plugins' section """
-        return self.core.get_option(self.SECTION, option_name, default_value)
-
-    def set_option(self, option_name, value):
-        """ Wrapper to set option to plugins' section """
-        return self.core.set_option(self.SECTION, option_name, value)
+        return self.cfg.get(option_name, default_value)
 
     def get_available_options(self):
         """ returns array containing known options for plugin """
@@ -89,7 +110,7 @@ class AbstractPlugin(object):
 
 
 class MonitoringDataListener(object):
-    """ Monitoring interface
+    """ Monitoring listener interface
     parent class for Monitoring data listeners"""
 
     def __init__(self):
@@ -114,21 +135,24 @@ class AggregateResultListener(object):
         data and stats are cached and synchronized by timestamp. Stat items
         are holded until corresponding data item is received and vice versa.
         """
-        raise NotImplementedError("Abstract method needs to be overridden")
+        raise NotImplementedError("Abstract method should be overridden")
 
 
 class AbstractInfoWidget(object):
-    ''' InfoWidgets interface
-    parent class for all InfoWidgets'''
+    """ InfoWidgets interface
+    parent class for all InfoWidgets"""
 
     def __init__(self):
         pass
 
     def render(self, screen):
-        raise NotImplementedError("Abstract method needs to be overridden")
+        raise NotImplementedError("Abstract method should be overridden")
+
+    def on_aggregated_data(self, data, stats):
+        raise NotImplementedError("Abstract method should be overridden")
 
     def get_index(self):
-        ''' get vertical priority index '''
+        """ get vertical priority index """
         return 0
 
 
@@ -164,6 +188,10 @@ class AbstractCriterion(object):
         """ long explanation to show after test stop """
         raise NotImplementedError("Abstract methods requires overriding")
 
+    def get_criterion_parameters(self):
+        """ returns dict with all criterion parameters """
+        raise NotImplementedError("Abstract methods requires overriding")
+
     def widget_explain(self):
         """ short explanation to display in right panel """
         return self.explain(), 0
@@ -174,7 +202,7 @@ class AbstractCriterion(object):
         raise NotImplementedError("Abstract methods requires overriding")
 
 
-class GeneratorPlugin(object):
+class GeneratorPlugin(AbstractPlugin):
     DEFAULT_INFO = {
         'address': '',
         'port': 80,
@@ -184,6 +212,16 @@ class GeneratorPlugin(object):
         'duration': 0,
         'loop_count': 0
     }
+
+    def __init__(self, core, cfg, name):
+        super(GeneratorPlugin, self).__init__(core, cfg, name)
+        self.stats_reader = None
+        self.reader = None
+        self.process = None
+        self.process_stderr = None
+        self.start_time = None
+        self.affinity = None
+        self.buffered_seconds = 2
 
     class Info(object):
         def __init__(
@@ -198,5 +236,46 @@ class GeneratorPlugin(object):
             self.loop_count = loop_count
 
     def get_info(self):
-        # type: () -> Info
+        """
+        :rtype: GeneratorPlugin.Info
+        """
         return self.Info(**self.DEFAULT_INFO)
+
+    def get_reader(self):
+        """
+
+        :rtype: collections.Iterable
+        """
+        pass
+
+    def get_stats_reader(self):
+        """
+
+        :rtype: collections.Iterable
+        """
+        pass
+
+    def end_test(self, retcode):
+        pass
+
+
+class StatsReader(object):
+    @staticmethod
+    def stats_item(ts, instances, rps):
+        return {
+            'ts': ts,
+            'metrics': {
+                'instances': instances,
+                'reqps': rps
+            }
+        }
+
+
+class MonitoringPlugin(AbstractPlugin):
+
+    def __init__(self, core, cfg, name):
+        super(MonitoringPlugin, self).__init__(core, cfg, name)
+        self.listeners = set()
+
+    def add_listener(self, plugin):
+        self.listeners.add(plugin)

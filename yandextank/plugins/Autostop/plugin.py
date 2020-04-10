@@ -3,12 +3,10 @@
 import logging
 import os.path
 
-from ...common.interfaces import AbstractPlugin, AggregateResultListener, AbstractInfoWidget
-
 from . import criterions as cr
 from . import cumulative_criterions as cum_cr
-from ..Aggregator import Plugin as AggregatorPlugin
 from ..Console import Plugin as ConsolePlugin
+from ...common.interfaces import AbstractPlugin, AggregateResultListener, AbstractInfoWidget
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +15,15 @@ class Plugin(AbstractPlugin, AggregateResultListener):
     """ Plugin that accepts criterion classes and triggers autostop """
     SECTION = 'autostop'
 
-    def __init__(self, core):
-        AbstractPlugin.__init__(self, core)
+    def __init__(self, core, cfg, name):
+        AbstractPlugin.__init__(self, core, cfg, name)
         AggregateResultListener.__init__(self)
 
         self.cause_criterion = None
+        self.imbalance_rps = 0
         self._criterions = {}
         self.custom_criterions = []
         self.counting = []
-        self.criterion_str = ''
         self._stop_report_path = ''
 
     @staticmethod
@@ -48,11 +46,9 @@ class Plugin(AbstractPlugin, AggregateResultListener):
         return ["autostop", "report_file"]
 
     def configure(self):
-        aggregator = self.core.get_plugin_of_type(AggregatorPlugin)
+        aggregator = self.core.job.aggregator
         aggregator.add_result_listener(self)
 
-        self.criterion_str = " ".join(
-            self.get_option("autostop", '').split("\n"))
         self._stop_report_path = os.path.join(
             self.core.artifacts_dir,
             self.get_option("report_file", 'autostop_report.txt'))
@@ -72,11 +68,12 @@ class Plugin(AbstractPlugin, AggregateResultListener):
         self.add_criterion_class(cum_cr.QuantileOfSaturationCriterion)
 
     def prepare_test(self):
-        for criterion_str in self.criterion_str.strip().split(")"):
+        criterions = self.get_option("autostop")
+        for criterion_str in criterions:
             if not criterion_str:
                 continue
             self.log.debug("Criterion string: %s", criterion_str)
-            self._criterions[criterion_str + ')'] = self.__create_criterion(
+            self._criterions[criterion_str] = self.__create_criterion(
                 criterion_str)
 
         self.log.debug("Criterion objects: %s", self._criterions)
@@ -92,7 +89,7 @@ class Plugin(AbstractPlugin, AggregateResultListener):
 
     def is_test_finished(self):
         if self.cause_criterion:
-            self.log.info(
+            self.log.warning(
                 "Autostop criterion requested test stop: %s",
                 self.cause_criterion.explain())
             return self.cause_criterion.get_rc()
@@ -116,9 +113,16 @@ class Plugin(AbstractPlugin, AggregateResultListener):
         if not self.cause_criterion:
             for criterion_text, criterion in self._criterions.iteritems():
                 if criterion.notify(data, stat):
-                    self.log.debug(
-                        "Autostop criterion requested test stop: %s", criterion)
                     self.cause_criterion = criterion
+                    if self.cause_criterion.cause_second:
+                        self.imbalance_rps = int(self.cause_criterion.cause_second[1]["metrics"]["reqps"])
+                        if not self.imbalance_rps:
+                            self.imbalance_rps = int(
+                                self.cause_criterion.cause_second[0]["overall"]["interval_real"]["len"])
+                    self.core.publish('autostop', 'rps', self.imbalance_rps)
+                    self.core.publish('autostop', 'reason', criterion.explain())
+                    self.log.warning(
+                        "Autostop criterion requested test stop on %d rps: %s", self.imbalance_rps, criterion_text)
                     open(self._stop_report_path, 'w').write(criterion_text)
                     self.core.add_artifact_file(self._stop_report_path)
 

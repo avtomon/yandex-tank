@@ -1,6 +1,7 @@
 """ The central part of the tool: Core """
 import datetime
 import fnmatch
+import glob
 import importlib as il
 import json
 import logging
@@ -10,21 +11,25 @@ import socket
 import tempfile
 import time
 import traceback
-import uuid
+import copy
 import pkg_resources
 import sys
 import platform
+
+import yaml
 from builtins import str
 
+from yandextank.common.const import RetCode
 from yandextank.common.exceptions import PluginNotPrepared
-from yandextank.common.interfaces import GeneratorPlugin
+from yandextank.common.interfaces import GeneratorPlugin, MonitoringPlugin, MonitoringDataListener
+from yandextank.plugins.DataUploader.client import LPRequisites
+from yandextank.validator.validator import TankConfig, ValidationError
+from yandextank.aggregator import TankAggregator
+from ..common.util import update_status, pid_exists
 
-from ..common.util import update_status, execute, pid_exists
+from netort.resource import manager as resource
+from netort.process import execute
 
-from ..common.resource import manager as resource
-from ..plugins.Aggregator import Plugin as AggregatorPlugin
-from ..plugins.Monitoring import Plugin as MonitoringPlugin
-from ..plugins.Telegraf import Plugin as TelegrafPlugin
 if sys.version_info[0] < 3:
     import ConfigParser
 else:
@@ -32,38 +37,32 @@ else:
 
 logger = logging.getLogger(__name__)
 
+CONFIGINITIAL = 'configinitial.yaml'
+VALIDATED_CONF = 'validated_conf.yaml'
+
 
 class Job(object):
     def __init__(
             self,
-            name,
-            description,
-            task,
-            version,
-            config_copy,
-            monitoring_plugin,
-            aggregator_plugin,
+            monitoring_plugins,
+            aggregator,
             tank,
             generator_plugin=None):
-        # type: (unicode, unicode, unicode, unicode, unicode, MonitoringPlugin,
-        # AggregatorPlugin, GeneratorPlugin) -> Job
-        self.name = name
-        self.description = description
-        self.task = task
-        self.version = version
-        self.config_copy = config_copy
-        self.monitoring_plugin = monitoring_plugin
-        self.aggregator_plugin = aggregator_plugin
+        """
+
+        :type aggregator: TankAggregator
+        :type monitoring_plugins: list of
+        """
+        self.monitoring_plugins = monitoring_plugins
+        self.aggregator = aggregator
         self.tank = tank
         self._phantom_info = None
         self.generator_plugin = generator_plugin
 
     def subscribe_plugin(self, plugin):
-        self.aggregator_plugin.add_result_listener(plugin)
-        try:
-            self.monitoring_plugin.monitoring.add_listener(plugin)
-        except AttributeError:
-            logging.warning('Monitoring plugin is not enabled')
+        self.aggregator.add_result_listener(plugin)
+        for monitoring_plugin in self.monitoring_plugins:
+            monitoring_plugin.add_listener(plugin)
 
     @property
     def phantom_info(self):
@@ -76,241 +75,235 @@ class Job(object):
         self._phantom_info = info
 
 
+def parse_plugin(s):
+    try:
+        plugin, config_section = s.split()
+    except ValueError:
+        plugin, config_section = s, None
+    return plugin, config_section
+
+
+class LockError(Exception):
+    pass
+
+
 class TankCore(object):
     """
     JMeter + dstat inspired :)
     """
-    SECTION = 'tank'
+    SECTION = 'core'
     SECTION_META = 'meta'
     PLUGIN_PREFIX = 'plugin_'
     PID_OPTION = 'pid'
     UUID_OPTION = 'uuid'
-    LOCK_DIR = '/var/lock'
+    API_JOBNO = 'api_jobno'
 
-    def __init__(self, artifacts_base_dir=None, artifacts_dir_name=None):
-        self.config = ConfigManager()
+    def __init__(self, configs, interrupted_event, artifacts_base_dir=None, artifacts_dir_name=None):
+        """
+
+        :param configs: list of dict
+        :param interrupted_event: threading.Event
+        """
+        self.output = {}
+        self.raw_configs = configs
         self.status = {}
-        self.plugins = []
-        self.artifacts_dir_name = artifacts_dir_name
+        self._plugins = None
         self._artifacts_dir = None
         self.artifact_files = {}
-        self.artifacts_base_dir = artifacts_base_dir
+        self.artifacts_to_send = []
+        self._artifacts_base_dir = None
         self.manual_start = False
         self.scheduled_start = None
-        self.interrupted = False
-        self.lock_file = None
-        self.flush_config_to = None
-        self.lock_dir = None
         self.taskset_path = None
         self.taskset_affinity = None
-        self.uuid = str(uuid.uuid4())
-        self.set_option(self.SECTION, self.UUID_OPTION, self.uuid)
-        self.set_option(self.SECTION, self.PID_OPTION, str(os.getpid()))
-        self.job = None
+        self._job = None
+        self._cfg_snapshot = None
 
-    def get_uuid(self):
-        return self.uuid
+        self.interrupted = interrupted_event
 
-    def get_available_options(self):
+        self.error_log = None
+        self.monitoring_data_listeners = []
+
+        error_output = 'validation_error.yaml'
+        self.config, self.errors, self.configinitial = TankConfig(self.raw_configs,
+                                                                  with_dynamic_options=True,
+                                                                  core_section=self.SECTION,
+                                                                  error_output=error_output).validate()
+        if not self.config:
+            raise ValidationError(self.errors)
+        self.test_id = self.get_option(self.SECTION, 'artifacts_dir',
+                                       datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S.%f"))
+        self.lock_dir = self.get_option(self.SECTION, 'lock_dir')
+        with open(os.path.join(self.artifacts_dir, CONFIGINITIAL), 'w') as f:
+            yaml.dump(self.configinitial, f)
+        self.add_artifact_file(error_output)
+        self.add_artifact_to_send(LPRequisites.CONFIGINITIAL, yaml.dump(self.configinitial))
+        configinfo = self.config.validated.copy()
+        configinfo.setdefault(self.SECTION, {})
+        configinfo[self.SECTION][self.API_JOBNO] = self.test_id
+        self.add_artifact_to_send(LPRequisites.CONFIGINFO, yaml.dump(configinfo))
+        with open(os.path.join(self.artifacts_dir, VALIDATED_CONF), 'w') as f:
+            yaml.dump(configinfo, f)
+        logger.info('New test id %s' % self.test_id)
+
+    @property
+    def cfg_snapshot(self):
+        if not self._cfg_snapshot:
+            self._cfg_snapshot = str(self.config)
+        return self._cfg_snapshot
+
+    @staticmethod
+    def get_available_options():
+        # todo: should take this from schema
         return [
-            "artifacts_base_dir", "artifacts_dir", "flush_config_to",
+            "artifacts_base_dir", "artifacts_dir",
             "taskset_path", "affinity"
         ]
 
-    def load_configs(self, configs):
-        """ Tells core to load configs set into options storage """
-        logger.info("Loading configs...")
-        self.config.load_files(configs)
-        dotted_options = []
-        for option, value in self.config.get_options(self.SECTION):
-            if '.' in option:
-                dotted_options += [option + '=' + value]
-        self.apply_shorthand_options(dotted_options, self.SECTION)
-        self.config.flush()
-        self.add_artifact_file(self.config.file)
-        self.set_option(self.SECTION, self.PID_OPTION, str(os.getpid()))
-        self.flush_config_to = self.get_option(
-            self.SECTION, "flush_config_to", "")
-        if self.flush_config_to:
-            self.config.flush(self.flush_config_to)
+    @property
+    def plugins(self):
+        """
+        :returns: {plugin_name: plugin_class, ...}
+        :rtype: dict
+        """
+        if self._plugins is None:
+            self.load_plugins()
+            if self._plugins is None:
+                self._plugins = {}
+        return self._plugins
+
+    @property
+    def artifacts_base_dir(self):
+        if not self._artifacts_base_dir:
+            try:
+                artifacts_base_dir = os.path.abspath(self.get_option(self.SECTION, "artifacts_base_dir"))
+            except ValidationError:
+                artifacts_base_dir = os.path.abspath('logs')
+            if not os.path.exists(artifacts_base_dir):
+                os.makedirs(artifacts_base_dir)
+                os.chmod(self.artifacts_base_dir, 0o755)
+            self._artifacts_base_dir = artifacts_base_dir
+        return self._artifacts_base_dir
 
     def load_plugins(self):
         """
         Tells core to take plugin options and instantiate plugin classes
         """
         logger.info("Loading plugins...")
-
-        if not self.artifacts_base_dir:
-            self.artifacts_base_dir = os.path.expanduser(
-                self.get_option(self.SECTION, "artifacts_base_dir", '.'))
-
-        if not self.artifacts_dir_name:
-            self.artifacts_dir_name = self.get_option(
-                self.SECTION, "artifacts_dir", "")
-
-        self.taskset_path = self.get_option(
-            self.SECTION, 'taskset_path', 'taskset')
-        self.taskset_affinity = self.get_option(self.SECTION, 'affinity', '')
-
-        options = self.config.get_options(self.SECTION, self.PLUGIN_PREFIX)
-        for (plugin_name, plugin_path) in options:
-            if not plugin_path:
-                logger.debug("Seems the plugin '%s' was disabled", plugin_name)
-                continue
+        for (plugin_name, plugin_path, plugin_cfg) in self.config.plugins:
             logger.debug("Loading plugin %s from %s", plugin_name, plugin_path)
-            # FIXME cleanup an old deprecated plugin path format
-            if '/' in plugin_path:
+            if plugin_path == "yandextank.plugins.Overload":
                 logger.warning(
-                    "Deprecated plugin path format: %s\n"
-                    "Should be in pythonic format. Example:\n"
-                    "    plugin_jmeter=yandextank.plugins.JMeter", plugin_path)
-                if plugin_path.startswith("Tank/Plugins/"):
-                    plugin_path = "yandextank.plugins." + \
-                                  plugin_path.split('/')[-1].split('.')[0]
-                    logger.warning("Converted plugin path to %s", plugin_path)
-                else:
-                    raise ValueError(
-                        "Couldn't convert plugin path to new format:\n    %s" %
-                        plugin_path)
+                    "Deprecated plugin name: 'yandextank.plugins.Overload'\n"
+                    "There is a new generic plugin now.\n"
+                    "Correcting to 'yandextank.plugins.DataUploader overload'")
+                plugin_path = "yandextank.plugins.DataUploader overload"
             try:
                 plugin = il.import_module(plugin_path)
             except ImportError:
-                if plugin_path.startswith("yatank_internal_"):
-                    logger.warning(
-                        "Deprecated plugin path format: %s\n"
-                        "Tank plugins are now orginized using"
-                        " namespace packages. Example:\n"
-                        "    plugin_jmeter=yandextank.plugins.JMeter",
-                        plugin_path)
-                    plugin_path = plugin_path.replace(
-                        "yatank_internal_", "yandextank.plugins.")
-                if plugin_path.startswith("yatank_"):
-                    logger.warning(
-                        "Deprecated plugin path format: %s\n"
-                        "Tank plugins are now orginized using"
-                        " namespace packages. Example:\n"
-                        "    plugin_jmeter=yandextank.plugins.JMeter",
-                        plugin_path)
-
-                    plugin_path = plugin_path.replace(
-                        "yatank_", "yandextank.plugins.")
-                logger.warning("Patched plugin path: %s", plugin_path)
-                plugin = il.import_module(plugin_path)
+                logger.warning('Plugin name %s path %s import error', plugin_name, plugin_path)
+                logger.debug('Plugin name %s path %s import error', plugin_name, plugin_path, exc_info=True)
+                raise
             try:
-                instance = getattr(plugin, 'Plugin')(self)
-            except:
-                logger.warning(
-                    "Deprecated plugin classname: %s. Should be 'Plugin'",
-                    plugin)
-                instance = getattr(
-                    plugin, plugin_path.split('.')[-1] + 'Plugin')(self)
+                instance = getattr(plugin, 'Plugin')(self, cfg=plugin_cfg, name=plugin_name)
+            except AttributeError:
+                logger.warning('Plugin %s classname should be `Plugin`', plugin_name)
+                raise
+            else:
+                self.register_plugin(self.PLUGIN_PREFIX + plugin_name, instance)
+        logger.debug("Plugin instances: %s", self._plugins)
 
-            self.plugins.append(instance)
-
-        logger.debug("Plugin instances: %s", self.plugins)
+    @property
+    def job(self):
+        if not self._job:
+            # monitoring plugin
+            monitorings = [plugin for plugin in self.plugins.values() if isinstance(plugin, MonitoringPlugin)]
+            # generator plugin
+            try:
+                gen = self.get_plugin_of_type(GeneratorPlugin)
+            except KeyError:
+                logger.warning("Load generator not found")
+                gen = GeneratorPlugin(self, {}, 'generator dummy')
+            # aggregator
+            aggregator = TankAggregator(gen)
+            self._job = Job(monitoring_plugins=monitorings,
+                            generator_plugin=gen,
+                            aggregator=aggregator,
+                            tank=socket.getfqdn())
+        return self._job
 
     def plugins_configure(self):
         """        Call configure() on all plugins        """
         self.publish("core", "stage", "configure")
-        if not os.path.exists(self.artifacts_base_dir):
-            os.makedirs(self.artifacts_base_dir)
-
-            os.chmod(self.artifacts_base_dir, 0o755)
 
         logger.info("Configuring plugins...")
-        if self.taskset_affinity != '':
-            self.taskset(os.getpid(), self.taskset_path, self.taskset_affinity)
+        self.taskset_affinity = self.get_option(self.SECTION, 'affinity')
+        if self.taskset_affinity:
+            self.__setup_taskset(self.taskset_affinity, pid=os.getpid())
 
-        # monitoring plugin
-        try:
-            mon = self.get_plugin_of_type(TelegrafPlugin)
-        except KeyError:
-            logger.debug("Telegraf plugin not found:", exc_info=True)
-            try:
-                mon = self.get_plugin_of_type(MonitoringPlugin)
-            except KeyError:
-                logger.debug("Monitoring plugin not found:", exc_info=True)
-                mon = None
-
-        # aggregator plugin
-        try:
-            aggregator = self.get_plugin_of_type(AggregatorPlugin)
-        except KeyError:
-            logger.warning("Aggregator plugin not found:", exc_info=True)
-            aggregator = None
-
-        # generator plugin
-        try:
-            gen = self.get_plugin_of_type(GeneratorPlugin)
-        except KeyError:
-            logger.warning("Load generator not found:", exc_info=True)
-            gen = None
-
-        self.job = Job(
-            name=self.get_option(self.SECTION_META, "job_name",
-                                 'none').decode('utf8'),
-            description=self.get_option(self.SECTION_META, "job_dsc",
-                                        '').decode('utf8'),
-            task=self.get_option(self.SECTION_META, 'task',
-                                 'dir').decode('utf8'),
-            version=self.get_option(self.SECTION_META, 'ver',
-                                    '').decode('utf8'),
-            config_copy=self.get_option(
-                self.SECTION_META, 'copy_config_to', 'config_copy'),
-            monitoring_plugin=mon,
-            aggregator_plugin=aggregator,
-            generator_plugin=gen,
-            tank=socket.getfqdn())
-
-        for plugin in self.plugins:
-            logger.debug("Configuring %s", plugin)
-            plugin.configure()
-            self.config.flush()
-        if self.flush_config_to:
-            self.config.flush(self.flush_config_to)
+        for plugin in self.plugins.values():
+            if not self.interrupted.is_set():
+                logger.debug("Configuring %s", plugin)
+                plugin.configure()
+                if isinstance(plugin, MonitoringDataListener):
+                    self.monitoring_data_listeners.append(plugin)
 
     def plugins_prepare_test(self):
         """ Call prepare_test() on all plugins        """
         logger.info("Preparing test...")
         self.publish("core", "stage", "prepare")
-        for plugin in self.plugins:
-            logger.debug("Preparing %s", plugin)
-            plugin.prepare_test()
-        if self.flush_config_to:
-            self.config.flush(self.flush_config_to)
+        for plugin in self.plugins.values():
+            if not self.interrupted.is_set():
+                logger.debug("Preparing %s", plugin)
+                plugin.prepare_test()
 
     def plugins_start_test(self):
         """        Call start_test() on all plugins        """
-        logger.info("Starting test...")
-        self.publish("core", "stage", "start")
-        for plugin in self.plugins:
-            logger.debug("Starting %s", plugin)
-            plugin.start_test()
-        if self.flush_config_to:
-            self.config.flush(self.flush_config_to)
+        if not self.interrupted.is_set():
+            logger.info("Starting test...")
+            self.publish("core", "stage", "start")
+            self.job.aggregator.start_test()
+            for plugin in self.plugins.values():
+                logger.debug("Starting %s", plugin)
+                start_time = time.time()
+                plugin.start_test()
+                logger.info("Plugin {0:s} required {1:f} seconds to start".format(plugin,
+                                                                                  time.time() - start_time))
+            self.publish('generator', 'test_start', self.job.generator_plugin.start_time)
 
     def wait_for_finish(self):
         """
         Call is_test_finished() on all plugins 'till one of them initiates exit
         """
+        if not self.interrupted.is_set():
+            logger.info("Waiting for test to finish...")
+            logger.info('Artifacts dir: {dir}'.format(dir=self.artifacts_dir))
+            self.publish("core", "stage", "shoot")
+            if not self.plugins:
+                raise RuntimeError("It's strange: we have no plugins loaded...")
 
-        logger.info("Waiting for test to finish...")
-        logger.info('Artifacts dir: {}'.format(self.artifacts_dir))
-        self.publish("core", "stage", "shoot")
-        if not self.plugins:
-            raise RuntimeError("It's strange: we have no plugins loaded...")
-
-        while not self.interrupted:
+        while not self.interrupted.is_set():
             begin_time = time.time()
-            for plugin in self.plugins:
+            aggr_retcode = self.job.aggregator.is_test_finished()
+            if aggr_retcode >= 0:
+                return aggr_retcode
+            for plugin_name, plugin in self.plugins.items():
                 logger.debug("Polling %s", plugin)
-                retcode = plugin.is_test_finished()
-                if retcode >= 0:
-                    return retcode
+                try:
+                    retcode = plugin.is_test_finished()
+                    if retcode >= 0:
+                        return retcode
+                except Exception:
+                    logger.warning('Plugin {} failed:'.format(plugin_name), exc_info=True)
+                    if isinstance(plugin, GeneratorPlugin):
+                        return RetCode.ERROR
+                    else:
+                        logger.warning('Disabling plugin {}'.format(plugin_name))
+                        plugin.is_test_finished = lambda: RetCode.CONTINUE
             end_time = time.time()
             diff = end_time - begin_time
             logger.debug("Polling took %s", diff)
-            logger.debug("Tank status:\n%s", json.dumps(self.status, indent=2))
+            logger.debug("Tank status: %s", json.dumps(self.status))
             # screen refresh every 0.5 s
             if diff < 0.5:
                 time.sleep(0.5 - diff)
@@ -320,22 +313,28 @@ class TankCore(object):
         """        Call end_test() on all plugins        """
         logger.info("Finishing test...")
         self.publish("core", "stage", "end")
+        self.publish('generator', 'test_end', time.time())
+        logger.info("Stopping load generator and aggregator")
+        retcode = self.job.aggregator.end_test(retcode)
+        logger.debug("RC after: %s", retcode)
 
-        for plugin in self.plugins:
+        logger.info('Stopping monitoring')
+        for plugin in self.job.monitoring_plugins:
+            logger.info('Stopping %s', plugin)
+            retcode = plugin.end_test(retcode) or retcode
+            logger.info('RC after: %s', retcode)
+
+        for plugin in [p for p in self.plugins.values() if
+                       p is not self.job.generator_plugin and p not in self.job.monitoring_plugins]:
             logger.debug("Finalize %s", plugin)
             try:
                 logger.debug("RC before: %s", retcode)
-                plugin.end_test(retcode)
+                retcode = plugin.end_test(retcode)
                 logger.debug("RC after: %s", retcode)
-            except Exception as ex:
-                logger.error("Failed finishing plugin %s: %s", plugin, ex)
-                logger.debug(
-                    "Failed finishing plugin: %s", traceback.format_exc(ex))
+            except Exception:  # FIXME too broad exception clause
+                logger.error("Failed finishing plugin %s", plugin, exc_info=True)
                 if not retcode:
                     retcode = 1
-
-        if self.flush_config_to:
-            self.config.flush(self.flush_config_to)
         return retcode
 
     def plugins_post_process(self, retcode):
@@ -344,42 +343,47 @@ class TankCore(object):
         """
         logger.info("Post-processing test...")
         self.publish("core", "stage", "post_process")
-
-        for plugin in self.plugins:
+        for plugin in self.plugins.values():
             logger.debug("Post-process %s", plugin)
             try:
                 logger.debug("RC before: %s", retcode)
                 retcode = plugin.post_process(retcode)
                 logger.debug("RC after: %s", retcode)
-            except Exception as ex:
-                logger.error("Failed post-processing plugin %s: %s", plugin, ex)
-                logger.debug(
-                    "Failed post-processing plugin: %s",
-                    traceback.format_exc(ex))
+            except Exception:  # FIXME too broad exception clause
+                logger.error("Failed post-processing plugin %s", plugin, exc_info=True)
                 if not retcode:
                     retcode = 1
-
-        if self.flush_config_to:
-            self.config.flush(self.flush_config_to)
-
-        self.__collect_artifacts()
-
         return retcode
 
-    def taskset(self, pid, path, affinity):
-        if affinity:
-            args = "%s -pc %s %s" % (path, affinity, pid)
-            retcode, stdout, stderr = execute(
-                args, shell=True, poll_period=0.1, catch_out=True)
-            logger.debug('taskset stdout: %s', stdout)
-            if retcode != 0:
-                raise KeyError(stderr)
-            else:
-                logger.info(
-                    "Enabled taskset for pid %s with affinity %s",
-                    str(pid), affinity)
+    def publish_monitoring_data(self, data):
+        """sends pending data set to listeners"""
+        for plugin in self.monitoring_data_listeners:
+            # deep copy to ensure each listener gets it's own copy
+            try:
+                plugin.monitoring_data(copy.deepcopy(data))
+            except Exception:
+                logger.error("Plugin failed to process monitoring data", exc_info=True)
 
-    def __collect_artifacts(self):
+    def __setup_taskset(self, affinity, pid=None, args=None):
+        """ if pid specified: set process w/ pid `pid` CPU affinity to specified `affinity` core(s)
+            if args specified: modify list of args for Popen to start w/ taskset w/ affinity `affinity`
+        """
+        self.taskset_path = self.get_option(self.SECTION, 'taskset_path')
+
+        if args:
+            return [self.taskset_path, '-c', affinity] + args
+
+        if pid:
+            args = "%s -pc %s %s" % (self.taskset_path, affinity, pid)
+            retcode, stdout, stderr = execute(args, shell=True, poll_period=0.1, catch_out=True)
+            logger.debug('taskset for pid %s stdout: %s', pid, stdout)
+            if retcode == 0:
+                logger.info("Enabled taskset for pid %s with affinity %s", str(pid), affinity)
+            else:
+                logger.debug('Taskset setup failed w/ retcode :%s', retcode)
+                raise KeyError(stderr)
+
+    def _collect_artifacts(self, validation_failed=False):
         logger.debug("Collecting artifacts")
         logger.info("Artifacts dir: %s", self.artifacts_dir)
         for filename, keep in self.artifact_files.items():
@@ -389,57 +393,24 @@ class TankCore(object):
                 logger.warn("Failed to collect file %s: %s", filename, ex)
 
     def get_option(self, section, option, default=None):
-        """
-        `Get` an option from option storage
-        and `set` if default specified.
-        """
-        if not self.config.config.has_section(section):
-            logger.debug("No section '%s', adding", section)
-            self.config.config.add_section(section)
-
-        try:
-            value = self.config.config.get(section, option).strip()
-        except ConfigParser.NoOptionError as ex:
-            if default is not None:
-                default = str(default)
-                self.config.config.set(section, option, default)
-                self.config.flush()
-                value = default.strip()
-            else:
-                logger.warn(
-                    "Mandatory option %s was not found in section %s", option,
-                    section)
-                raise ex
-
-        if len(value) > 1 and value[0] == '`' and value[-1] == '`':
-            logger.debug("Expanding shell option %s", value)
-            retcode, stdout, stderr = execute(value[1:-1], True, 0.1, True)
-            if retcode or stderr:
-                raise ValueError(
-                    "Error expanding option %s, RC: %s" % (value, retcode))
-            value = stdout.strip()
-
-        return value
+        return self.config.get_option(section, option, default)
 
     def set_option(self, section, option, value):
         """
         Set an option in storage
         """
-        if not self.config.config.has_section(section):
-            self.config.config.add_section(section)
-        self.config.config.set(section, option, value)
-        self.config.flush()
+        raise NotImplementedError
+
+    def set_exitcode(self, code):
+        self.output['core']['exitcode'] = code
 
     def get_plugin_of_type(self, plugin_class):
         """
         Retrieve a plugin of desired class, KeyError raised otherwise
         """
         logger.debug("Searching for plugin: %s", plugin_class)
-        matches = [
-            plugin for plugin in self.plugins
-            if isinstance(plugin, plugin_class)
-        ]
-        if len(matches) > 0:
+        matches = [plugin for plugin in self.plugins.values() if isinstance(plugin, plugin_class)]
+        if matches:
             if len(matches) > 1:
                 logger.debug(
                     "More then one plugin of type %s found. Using first one.",
@@ -447,6 +418,21 @@ class TankCore(object):
             return matches[-1]
         else:
             raise KeyError("Requested plugin type not found: %s" % plugin_class)
+
+    def get_plugins_of_type(self, plugin_class):
+        """
+        Retrieve a list of plugins of desired class, KeyError raised otherwise
+        """
+        logger.debug("Searching for plugins: %s", plugin_class)
+        matches = [plugin for plugin in self.plugins.values() if isinstance(plugin, plugin_class)]
+        if matches:
+            return matches
+        else:
+            raise KeyError("Requested plugin type not found: %s" % plugin_class)
+
+    def get_jobno(self, plugin_name='plugin_lunapark'):
+        uploader_plugin = self.plugins[plugin_name]
+        return uploader_plugin.lp_job.number
 
     def __collect_file(self, filename, keep_original=False):
         """
@@ -480,73 +466,21 @@ class TankCore(object):
                 filename)
             self.artifact_files[filename] = keep_original
 
+    def add_artifact_to_send(self, lp_requisites, content):
+        self.artifacts_to_send.append((lp_requisites, content))
+
     def apply_shorthand_options(self, options, default_section='DEFAULT'):
         for option_str in options:
+            key, value = option_str.split('=')
             try:
-                section = option_str[:option_str.index('.')]
-                option = option_str[option_str.index('.') + 1:option_str.index(
-                    '=')]
+                section, option = key.split('.')
             except ValueError:
                 section = default_section
-                option = option_str[:option_str.index('=')]
-            value = option_str[option_str.index('=') + 1:]
+                option = key
             logger.debug(
                 "Override option: %s => [%s] %s=%s", option_str, section,
                 option, value)
             self.set_option(section, option, value)
-
-    def get_lock_dir(self):
-        if not self.lock_dir:
-            self.lock_dir = self.get_option(
-                self.SECTION, "lock_dir", self.LOCK_DIR)
-
-        return os.path.expanduser(self.lock_dir)
-
-    def get_lock(self, force=False):
-        if not force and self.__there_is_locks():
-            raise RuntimeError("There is lock files")
-
-        fh, self.lock_file = tempfile.mkstemp(
-            '.lock', 'lunapark_', self.get_lock_dir())
-        os.close(fh)
-        os.chmod(self.lock_file, 0o644)
-        self.config.file = self.lock_file
-        self.config.flush()
-
-    def release_lock(self):
-        self.config.file = None
-        if self.lock_file and os.path.exists(self.lock_file):
-            logger.debug("Releasing lock: %s", self.lock_file)
-            os.remove(self.lock_file)
-
-    def __there_is_locks(self):
-        retcode = False
-        lock_dir = self.get_lock_dir()
-        for filename in os.listdir(lock_dir):
-            if fnmatch.fnmatch(filename, 'lunapark_*.lock'):
-                full_name = os.path.join(lock_dir, filename)
-                logger.warn("Lock file present: %s", full_name)
-
-                try:
-                    info = ConfigParser.ConfigParser()
-                    info.read(full_name)
-                    pid = info.get(TankCore.SECTION, self.PID_OPTION)
-                    if not pid_exists(int(pid)):
-                        logger.debug(
-                            "Lock PID %s not exists, ignoring and "
-                            "trying to remove", pid)
-                        try:
-                            os.remove(full_name)
-                        except Exception as exc:
-                            logger.debug(
-                                "Failed to delete lock %s: %s", full_name, exc)
-                    else:
-                        retcode = True
-                except Exception as exc:
-                    logger.warn(
-                        "Failed to load info from lock %s: %s", full_name, exc)
-                    retcode = True
-        return retcode
 
     def mkstemp(self, suffix, prefix, directory=None):
         """
@@ -554,7 +488,7 @@ class TankCore(object):
         and close temp file handle
         """
         if not directory:
-            directory = self.artifacts_base_dir
+            directory = self.artifacts_dir
         fd, fname = tempfile.mkstemp(suffix, prefix, directory)
         os.close(fd)
         os.chmod(fname, 0o644)  # FIXME: chmod to parent dir's mode?
@@ -568,8 +502,7 @@ class TankCore(object):
         Call close() for all plugins
         """
         logger.info("Close allocated resources...")
-
-        for plugin in self.plugins:
+        for plugin in self.plugins.values():
             logger.debug("Close %s", plugin)
             try:
                 plugin.close()
@@ -581,15 +514,11 @@ class TankCore(object):
     @property
     def artifacts_dir(self):
         if not self._artifacts_dir:
-            if not self.artifacts_dir_name:
-                date_str = datetime.datetime.now().strftime(
-                    "%Y-%m-%d_%H-%M-%S.")
-                self.artifacts_dir_name = tempfile.mkdtemp(
-                    "", date_str, self.artifacts_base_dir)
-            elif not os.path.isdir(self.artifacts_dir_name):
-                os.makedirs(self.artifacts_dir_name)
-            os.chmod(self.artifacts_dir_name, 0o755)
-            self._artifacts_dir = os.path.abspath(self.artifacts_dir_name)
+            new_path = os.path.join(self.artifacts_base_dir, self.test_id)
+            if not os.path.isdir(new_path):
+                os.makedirs(new_path)
+            os.chmod(new_path, 0o755)
+            self._artifacts_dir = os.path.abspath(new_path)
         return self._artifacts_dir
 
     @staticmethod
@@ -602,6 +531,105 @@ class TankCore(object):
         os_agent = 'OS/{}'.format(platform.platform())
         return ' '.join((tank_agent, python_agent, os_agent))
 
+    def register_plugin(self, plugin_name, instance):
+        if self._plugins is None:
+            self._plugins = {}
+        if self._plugins.get(plugin_name, None) is not None:
+            logger.exception('Plugins\' names should diverse')
+        self._plugins[plugin_name] = instance
+
+    def save_cfg(self, path):
+        self.config.dump(path)
+
+    def plugins_cleanup(self):
+        for plugin_name, plugin in self.plugins.items():
+            logger.info('Cleaning up plugin {}'.format(plugin_name))
+            plugin.cleanup()
+
+
+class Lock(object):
+    PID = 'pid'
+    TEST_ID = 'test_id'
+    TEST_DIR = 'test_dir'
+    LOCK_FILE_WILDCARD = 'lunapark_*.lock'
+
+    def __init__(self, test_id, test_dir, pid=None):
+        self.test_id = test_id
+        self.test_dir = test_dir
+        self.pid = pid if pid is not None else os.getpid()
+        self.info = {
+            self.PID: self.pid,
+            self.TEST_ID: self.test_id,
+            self.TEST_DIR: self.test_dir
+        }
+        self.lock_file = None
+
+    def acquire(self, lock_dir, ignore=False):
+        is_locked = self.is_locked(lock_dir)
+        if not ignore and is_locked:
+            raise LockError("Lock file(s) found\n{}".format(is_locked))
+        prefix, suffix = self.LOCK_FILE_WILDCARD.split('*')
+        fh, self.lock_file = tempfile.mkstemp(suffix, prefix, lock_dir)
+        os.close(fh)
+        with open(self.lock_file, 'w') as f:
+            yaml.dump(self.info, f)
+        os.chmod(self.lock_file, 0o644)
+        return self
+
+    def release(self):
+        if self.lock_file is not None and os.path.exists(self.lock_file):
+            logger.info("Releasing lock: %s", self.lock_file)
+            os.remove(self.lock_file)
+        else:
+            logger.warning('Lock file not found')
+
+    @classmethod
+    def load(cls, path):
+        with open(path) as f:
+            info = yaml.load(f, Loader=yaml.FullLoader)
+        pid = info.get(cls.PID)
+        test_id = info.get(cls.TEST_ID)
+        test_dir = info.get(cls.TEST_DIR)
+        lock = Lock(test_id, test_dir, pid)
+        lock.lock_file = path
+        return lock
+
+    def __str__(self):
+        return str(self.info)
+
+    @classmethod
+    def is_locked(cls, lock_dir='/var/lock'):
+        for filename in os.listdir(lock_dir):
+            if fnmatch.fnmatch(filename, cls.LOCK_FILE_WILDCARD):
+                full_name = os.path.join(lock_dir, filename)
+                logger.info("Lock file is found: %s", full_name)
+                try:
+                    running_lock = cls.load(full_name)
+                    if not running_lock.pid:
+                        msg = 'Failed to get {} from lock file {}.'.format(cls.PID,
+                                                                           full_name)
+                        logger.warning(msg)
+                        return msg
+                    else:
+                        if not pid_exists(int(running_lock.pid)):
+                            logger.info("Lock PID %s not exists, ignoring and trying to remove", running_lock.pid)
+                            try:
+                                os.remove(full_name)
+                            except Exception as exc:
+                                logger.warning("Failed to delete lock %s: %s", full_name, exc)
+                            return False
+                        else:
+                            return "Another test is running: {}".format(running_lock)
+                except Exception:
+                    msg = "Failed to load info from lock %s" % full_name
+                    logger.warn(msg, exc_info=True)
+                    return msg
+        return False
+
+    @classmethod
+    def running_ids(cls, lock_dir='/var/lock'):
+        return [Lock.load(fname).test_id for fname in glob.glob(os.path.join(lock_dir, cls.LOCK_FILE_WILDCARD))]
+
 
 class ConfigManager(object):
     """ Option storage class """
@@ -613,9 +641,7 @@ class ConfigManager(object):
     def load_files(self, configs):
         """         Read configs set into storage        """
         logger.debug("Reading configs: %s", configs)
-        config_filenames = [
-            resource.resource_filename(config) for config in configs
-        ]
+        config_filenames = [resource.resource_filename(config) for config in configs]
         try:
             self.config.read(config_filenames)
         except Exception as ex:
